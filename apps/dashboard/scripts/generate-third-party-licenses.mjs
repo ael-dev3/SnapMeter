@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import process from "node:process";
@@ -6,8 +7,13 @@ export const NOTICE_FILE_NAME = "THIRD_PARTY_LICENSES.txt";
 export const ENVIRONMENT_NOTICE_PATH = join(".vite", "third-party-licenses.md");
 
 const dashboardRoot = resolve(import.meta.dirname, "..");
+const repositoryRoot = resolve(dashboardRoot, "..", "..");
 const distRoot = join(dashboardRoot, "dist");
 const generatedDevVarsPath = join(distRoot, "snapmeter", ".dev.vars");
+const apacheLicensePath = join(repositoryRoot, "LICENSES", "Apache-2.0.txt");
+const APACHE_LICENSE_SHA256 = "283ea6cc2997a1a70da0049e09adf9317bb60ca1b51279b65196b83a69e1996b";
+export const WARPKEEP_SOURCE_COMMIT = "96e49cdb60b2fc8483e63f9df58447e5acbc6b92";
+export const WARPKEEP_NOTICE_COPYRIGHT = "Copyright 2026 Warpkeep contributors";
 const APACHE_ATTRIBUTIONS = new Map([
   ["comlink", "Copyright 2019 Google LLC"]
 ]);
@@ -44,6 +50,37 @@ const REVIEWED_MISSING_LICENSE_TEXTS = new Map([
 
 function normalized(value) {
   return value.replaceAll("\r\n", "\n").trim();
+}
+
+function warpkeepAdaptationNotice() {
+  let license;
+  try {
+    license = normalized(readFileSync(apacheLicensePath, "utf8"));
+  } catch {
+    throw new Error(`missing Apache-2.0 license: ${relative(repositoryRoot, apacheLicensePath)}`);
+  }
+  const digest = createHash("sha256").update(license).digest("hex");
+  if (digest !== APACHE_LICENSE_SHA256) {
+    throw new Error(`Apache-2.0 license is incomplete or stale: ${relative(repositoryRoot, apacheLicensePath)}`);
+  }
+  return [
+    "Warpkeep-derived Mini App code",
+    "--------------------------------",
+    "",
+    "Portions of the browser Mini App runtime and provider were adapted and",
+    "modified from Warpkeep under the Apache License 2.0.",
+    `Source: https://github.com/ael-dev3/Warpkeep/tree/${WARPKEEP_SOURCE_COMMIT}`,
+    "",
+    "Applicable upstream NOTICE:",
+    "",
+    "Warpkeep",
+    WARPKEEP_NOTICE_COPYRIGHT,
+    "",
+    "Apache License 2.0",
+    "------------------",
+    "",
+    license
+  ].join("\n");
 }
 
 function withRequiredAttributions(source) {
@@ -92,16 +129,20 @@ function readEnvironmentNotice(environment) {
 }
 
 export function expectedThirdPartyNotice() {
+  const warpkeep = warpkeepAdaptationNotice();
   const client = readEnvironmentNotice("client");
   const worker = readEnvironmentNotice("snapmeter");
   return [
     "SnapMeter third-party redistribution notices",
     "============================================",
     "",
-    "This file is generated from the exact production modules bundled by Vite.",
-    "It covers both the public browser assets and the Cloudflare Worker bundle.",
+    "This file combines the required notice for adapted project code with licenses",
+    "generated from the exact production modules bundled by Vite. It covers both",
+    "the public browser assets and the Cloudflare Worker bundle.",
     "The source release and its separately vendored protocol notices are documented",
     "in the repository root THIRD_PARTY_NOTICES.md.",
+    "",
+    warpkeep,
     "",
     "Browser bundle",
     "--------------",

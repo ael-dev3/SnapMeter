@@ -49,5 +49,6 @@ the PR description and CI logs.
 By submitting a contribution, you agree that your SnapMeter-authored
 contribution is licensed under the repository's MIT license. Do not submit
 third-party material unless redistribution is permitted and its exact source,
-license, and notice requirements are included. The vendored Snapchain
-protobufs are separately identified in `THIRD_PARTY_NOTICES.md`.
+license, and notice requirements are included. The vendored and adapted
+Snapchain protobufs and Warpkeep-derived Mini App portions are separately
+identified in `THIRD_PARTY_NOTICES.md`.

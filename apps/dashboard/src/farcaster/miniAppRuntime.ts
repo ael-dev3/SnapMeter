@@ -1,3 +1,7 @@
+// Adapted from ael-dev3/Warpkeep at commit
+// 96e49cdb60b2fc8483e63f9df58447e5acbc6b92 (Apache-2.0).
+// Modified for SnapMeter; see THIRD_PARTY_NOTICES.md.
+
 export type MiniAppSafeAreaInsets = Readonly<{
   top: number;
   right: number;

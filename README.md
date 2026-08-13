@@ -155,7 +155,7 @@ Pull requests run the quality gates. Default-branch deployment is conditional on
 
 ## License
 
-SnapMeter-authored source, documentation, and assets are released under the [MIT License](LICENSE), copyright 2026 ael-dev3. Vendored Snapchain protocol definitions retain their upstream `GPL-3.0` license; see [Third-party notices](THIRD_PARTY_NOTICES.md) and the included license text. Dependency packages retain their own licenses. No license grants rights to third-party names or trademarks.
+SnapMeter-authored source, documentation, and assets are released under the [MIT License](LICENSE), copyright 2026 ael-dev3. Vendored and adapted Snapchain protocol definitions retain upstream `GPL-3.0-only` terms, while the identified Warpkeep-derived Mini App portions retain Apache-2.0 notices. See [Third-party notices](THIRD_PARTY_NOTICES.md) and the complete texts in [`LICENSES/`](LICENSES/). Dependency packages retain their own licenses. No license grants rights to third-party names or trademarks.
 
 ## Documentation
 
