@@ -1,6 +1,7 @@
-// Wire-compatible analytics subset vendored from farcasterxyz/snapchain at
-// 6152402aea2dbe732fb73076f674b038bfd4aee5. Unknown upstream fields are safely
-// ignored by protobuf. See docs/upstream-sources.md.
+// Adapted and modified for SnapMeter on 2026-08-13 from farcasterxyz/snapchain
+// at 6152402aea2dbe732fb73076f674b038bfd4aee5. This wire-compatible analytics
+// subset ignores unknown upstream fields safely through protobuf. Distributed
+// under GPL-3.0-only; see THIRD_PARTY_NOTICES.md and docs/upstream-sources.md.
 syntax = "proto3";
 
 enum HubEventType {

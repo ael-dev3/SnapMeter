@@ -3,7 +3,9 @@ import { join, relative, resolve } from "node:path";
 import process from "node:process";
 import {
   expectedThirdPartyNotice,
-  NOTICE_FILE_NAME
+  NOTICE_FILE_NAME,
+  WARPKEEP_NOTICE_COPYRIGHT,
+  WARPKEEP_SOURCE_COMMIT
 } from "./generate-third-party-licenses.mjs";
 
 const root = resolve(import.meta.dirname, "..");
@@ -72,6 +74,11 @@ if (expectedNotice !== undefined) {
   }
 
   const requiredInventory = [
+    "Warpkeep-derived Mini App code",
+    `https://github.com/ael-dev3/Warpkeep/tree/${WARPKEEP_SOURCE_COMMIT}`,
+    WARPKEEP_NOTICE_COPYRIGHT,
+    "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION",
+    "END OF TERMS AND CONDITIONS",
     "## @farcaster/miniapp-sdk - 0.3.0 (MIT)",
     "## @farcaster/quick-auth - 0.0.8 (MIT)",
     "## comlink - 4.4.2 (Apache-2.0)",
