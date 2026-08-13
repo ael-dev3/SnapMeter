@@ -14,6 +14,7 @@ export { LiveRoom };
 
 const MAX_BODY_BYTES = 512 * 1024;
 const MAX_FUTURE_RECORD_SKEW_MS = 60_000;
+const STRICT_TRANSPORT_SECURITY = "max-age=63072000; includeSubDomains";
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -22,13 +23,34 @@ const JSON_HEADERS = {
 };
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContextLike): Promise<Response> {
-    return handleRequest(request, env, ctx);
+  async fetch(request: Request, env: Env, ctx: ExecutionContextLike): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.protocol !== "https:") {
+      url.protocol = "https:";
+      return new Response(null, {
+        status: 308,
+        headers: { location: url.toString(), "cache-control": "no-store" }
+      });
+    }
+    return withStrictTransportSecurity(await handleRequest(request, env, ctx));
   },
   scheduled(controller: ScheduledControllerLike, env: Env, ctx: ExecutionContextLike): void {
     ctx.waitUntil(runScheduled(controller, env));
   }
 };
+
+function withStrictTransportSecurity(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("strict-transport-security", STRICT_TRANSPORT_SECURITY);
+  if (response.status === 101 && response.webSocket) {
+    return new Response(null, { status: 101, headers, webSocket: response.webSocket });
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
 
 export async function handleRequest(request: Request, env: Env, _ctx?: ExecutionContextLike): Promise<Response> {
   const url = new URL(request.url);

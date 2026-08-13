@@ -121,6 +121,20 @@ async function expectQuiet(socket: WebSocket, durationMs = 400): Promise<void> {
 }
 
 describe("Worker API", () => {
+  it("redirects insecure API requests before handling and emits HSTS over HTTPS", async () => {
+    const insecure = await SELF.fetch("http://snapmeter.test/api/v1/metadata?probe=transport", {
+      redirect: "manual"
+    });
+    expect(insecure.status).toBe(308);
+    expect(insecure.headers.get("location")).toBe("https://snapmeter.test/api/v1/metadata?probe=transport");
+    expect(insecure.headers.get("cache-control")).toBe("no-store");
+    expect(insecure.headers.get("strict-transport-security")).toBeNull();
+
+    const secure = await SELF.fetch("https://snapmeter.test/api/v1/metadata");
+    expect(secure.status).toBe(200);
+    expect(secure.headers.get("strict-transport-security")).toBe("max-age=63072000; includeSubDomains");
+  });
+
   it("reports pinned source metadata and disconnected status honestly", async () => {
     const metadata = await SELF.fetch("https://snapmeter.test/api/v1/metadata");
     expect(metadata.status).toBe(200);
@@ -137,6 +151,16 @@ describe("Worker API", () => {
       headers: { Upgrade: "websocket", Origin: "https://attacker.example" }
     });
     expect(response.status).toBe(403);
+  });
+
+  it("emits HSTS on successful WebSocket upgrades", async () => {
+    const response = await SELF.fetch("https://snapmeter.test/api/v1/live", {
+      headers: { Upgrade: "websocket" }
+    });
+    expect(response.status).toBe(101);
+    expect(response.headers.get("strict-transport-security")).toBe("max-age=63072000; includeSubDomains");
+    response.webSocket?.accept();
+    response.webSocket?.close(1000, "done");
   });
 
   it("authenticates an empty doctor probe without storing it", async () => {
