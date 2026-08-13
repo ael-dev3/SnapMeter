@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">SnapMeter</title>
+  <rect width="512" height="512" rx="112" fill="#07090c"/>
+  <path d="M54 267h83l27-54 43 123 53-192 45 144 32-67 32 46h89" fill="none" stroke="#4bddff" stroke-width="27" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="260" cy="144" r="14" fill="#bc7fff"/>
+</svg>

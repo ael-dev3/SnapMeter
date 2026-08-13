@@ -1,0 +1,45 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "snapmeter",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-08-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "snapmeter-prod",
+      "database_id": "5967e094-5ed9-47c8-aa8f-c5888704f0f9",
+      "migrations_dir": "../../migrations",
+      "migrations_table": "d1_migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LIVE_ROOM",
+        "class_name": "LiveRoom"
+      }
+    ]
+  },
+  "exports": {
+    "LiveRoom": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "triggers": {
+    "crons": ["* * * * *", "17 3 * * *"]
+  },
+  "secrets": {
+    "required": ["SNAPMETER_INGEST_SECRET"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
