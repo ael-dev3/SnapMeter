@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { statSync } from "node:fs";
-import { loadConfig } from "./config.js";
+import { loadConfig, type RpcEndpointConfig } from "./config.js";
 import { CollectorRuntime } from "./collector.js";
 import { CollectorDatabase } from "./database.js";
 import { runDoctor } from "./doctor.js";
@@ -82,14 +82,23 @@ function assertSupportedNode(): void {
   }
 }
 
-function endpointSummary(endpoint: { url: string; tls: boolean; sourceMode: string; authorization?: string; apiKey?: string; getEventsMinIntervalMs: number }): Record<string, unknown> {
+function endpointSummary(endpoint: RpcEndpointConfig): Record<string, unknown> {
   return {
     url: endpoint.url,
+    transport: endpoint.transport,
     tls: endpoint.tls,
     sourceMode: endpoint.sourceMode,
     authorizationConfigured: Boolean(endpoint.authorization),
     apiKeyConfigured: Boolean(endpoint.apiKey),
-    getEventsMinIntervalMs: endpoint.getEventsMinIntervalMs
+    getEventsMinIntervalMs: endpoint.getEventsMinIntervalMs,
+    identityPinned: Boolean(endpoint.expectedPeerId || endpoint.expectedVersion),
+    fallback: endpoint.fallback ? {
+      transport: endpoint.fallback.transport,
+      tls: endpoint.fallback.tls,
+      identityPinned: Boolean(endpoint.fallback.expectedPeerId && endpoint.fallback.expectedVersion),
+      getEventsMinIntervalMs: endpoint.fallback.getEventsMinIntervalMs,
+      pollIntervalMs: endpoint.fallback.pollIntervalMs
+    } : null
   };
 }
 

@@ -409,14 +409,23 @@ describe("Worker API", () => {
 
       const fresh = batch();
       fresh.cursors = [{ source: "snapchain", shard: 1, eventId: "11", verifiedAtMs: Date.now() }];
+      // The Cloudflare harness can take long enough for this test to cross a
+      // UTC minute boundary. Saturate both the current and immediately next
+      // window so the assertion tests replay accounting, not wall-clock luck.
+      const requestWindowStartMs = Math.floor(Date.now() / 60_000) * 60_000;
+      for (const saturatedWindow of [requestWindowStartMs, requestWindowStartMs + 60_000]) {
+        await env.DB.prepare(
+          "INSERT INTO rate_windows(source, collector_id, window_start_ms, batch_count) VALUES ('snapchain', ?, ?, 300) ON CONFLICT(source, collector_id, window_start_ms) DO UPDATE SET batch_count=300"
+        ).bind(SOURCE_RATE_SCOPE, saturatedWindow).run();
+      }
       const limited = await SELF.fetch(await signedRequest(fresh));
       expect(limited.status).toBe(429);
       expect(await limited.json()).toMatchObject({ error: "rate_limited" });
     } finally {
       await env.DB.prepare("DELETE FROM ingest_batches WHERE batch_id=?").bind(payload.batchId).run();
       await env.DB.prepare(
-        "DELETE FROM rate_windows WHERE source='snapchain' AND collector_id=? AND window_start_ms=?"
-      ).bind(SOURCE_RATE_SCOPE, windowStartMs).run();
+        "DELETE FROM rate_windows WHERE source='snapchain' AND collector_id=? AND window_start_ms BETWEEN ? AND ?"
+      ).bind(SOURCE_RATE_SCOPE, windowStartMs, Math.floor(Date.now() / 60_000) * 60_000 + 60_000).run();
     }
   });
 

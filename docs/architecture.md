@@ -5,16 +5,16 @@
 SnapMeter separates private node access from public reads:
 
 ```text
-Snapchain HubService ----+       signed, replay-safe batches
-                         +--> collector ------------------------+
-Hypersnap HubService ----+     SQLite + outbox + per-shard state |
-                                                                 v
+Snapchain HubService --------------------+       signed, replay-safe batches
+                                         +--> collector ------------------------+
+Hypersnap local gRPC (preferred) --------+     SQLite + outbox + per-shard state |
+Hypersnap HTTPS events (fallback only) --+                                         v
 mobile/desktop browser <---- Worker read API <---- D1 + LiveRoom Durable Object
          ^                                                 |
          +--------------- hibernating WebSocket -----------+
 ```
 
-The collector is the only component that talks to node gRPC endpoints. The Worker is the only public ingress. Browsers use same-origin HTTP reads and a public read-only WebSocket; they never see RPC or ingest credentials.
+The collector is the only component that talks to node RPC endpoints. Snapchain and the preferred local Hypersnap source use gRPC; the optional Hypersnap fallback uses a read-only HTTPS JSON API. The Worker is the only public write ingress. Browsers use same-origin HTTP reads and a public read-only WebSocket; they never see RPC or ingest credentials.
 
 ## Collector
 
@@ -34,6 +34,16 @@ Each `(source instance, shard)` owns:
 `Subscribe` events and reconciled events enter one SQLite transaction path. Subscription arrival never skips an unseen range. The verified cursor advances only after the event, actor-window state, daily membership, and minute aggregate are safe. If a crash occurs before the subsequent checkpoint, inclusive replay is harmless because incorporation is idempotent. Backoff uses bounded exponential delay with jitter, and shutdown drains transaction boundaries without pretending an unacknowledged outbox item was delivered.
 
 The local database retains only analytics metadata: event identity/type, FID, action/receipt times, replay classification, actor-window/day membership, compact time buckets, source health, cursors, and outbox state. It does not retain or upload cast text, signatures, or private RPC metadata. Retention is bounded but must preserve at least 31 days needed for exact metric reconstruction.
+
+### Hypersnap endpoint state machine
+
+The Hypersnap source has one preferred role and at most one fallback role. They are replicas for one source identity, not two streams: only one client/session and one set of shard workers is active at a time.
+
+Before activation, either candidate must pass exact version/peer pins where configured, full positive-shard coverage, the maximum block-delay threshold, durable endpoint enrollment, and cursor continuity. For each nonzero durable cursor, `GetEvent`/`eventById` must return the same source/shard/event ID and normalized SHA-256 event fingerprint already stored locally. This prevents silent history replacement when changing transport or operator. It does not prove events not yet observed by the collector.
+
+Startup tries preferred local gRPC first and then the HTTPS fallback. An active endpoint is abandoned after the configured count of repeated discovery failures or sustained incomplete coverage. While fallback is active, successful preferred probes accumulate at the configured recovery interval; a failed probe resets the count. Reaching the recovery-success threshold closes the fallback session, clears transient connection state, opens the preferred endpoint, and reconciles from the same durable cursors. Any incompatibility leaves the source unavailable/partial rather than resetting history.
+
+The HTTP fallback maps `/v1/info`, `/v1/eventById`, and `/v1/events` to the collector RPC boundary. There is no public streaming method, so its `Subscribe` role is a bounded poller; `GetEvents` remains the durable authority. Default five-second head polling and one-second global request-start pacing keep two idle shard pollers near 0.4 requests per second while preserving request capacity for replay, trading a few seconds of pulse latency for bounded pressure on a public service.
 
 ## Replay and completeness
 
@@ -79,4 +89,7 @@ D1 holds compact minute buckets, daily metrics/membership, snapshots, source sta
 | Cloud outage | Keep aggregates in the durable outbox and do not claim cloud acknowledgement. |
 | Duplicate/out-of-order batch | Reject replay or idempotently return the existing result; do not double-count. |
 | Stale collector | Public source status becomes stale/disconnected even if the site itself remains available. |
-| Hypersnap RPC unavailable | Hypersnap becomes `unavailable`; derived metrics are not promoted to verified. |
+| Preferred Hypersnap RPC unavailable | Activate the enrolled HTTPS replica only after its identity, shards, delay, cursor, and fingerprints validate; otherwise Hypersnap becomes `unavailable`. |
+| Fallback active and preferred recovers | Require consecutive healthy preferred probes, then switch one session at a time and reconcile before trusting live pulses. |
+| Endpoint identity/version/shards drift | Reject activation. An environment change alone cannot override durable enrollment. |
+| Cursor predates fallback retention | Reject fallback continuity and remain unavailable/partial; never reset the cursor. |

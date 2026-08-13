@@ -1,14 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { IngestBatch } from "@snapmeter/contracts";
-import { FARCASTER_EPOCH_MS, type NodeInfo, type RawHubEvent } from "@snapmeter/protocol";
-import { CollectorRuntime, discoveredShardIds } from "./collector.js";
+import { FARCASTER_EPOCH_MS, rawHubEventFingerprint, type NodeInfo, type RawHubEvent } from "@snapmeter/protocol";
+import { CollectorRuntime, discoveredShardIds, validateCandidateInfo } from "./collector.js";
 import { loadConfig } from "./config.js";
 import { CollectorDatabase } from "./database.js";
 import { createLogger } from "./logger.js";
 import { rawEventShard, type CollectorRpc, type RpcFactory, type RpcSubscription } from "./rpc.js";
 
+const TEST_FARCASTER_SECONDS = Math.floor((Date.now() - FARCASTER_EPOCH_MS) / 1_000);
+
 function mergeEvent(id: string, fid: string): RawHubEvent {
-  const seconds = Math.floor((Date.now() - FARCASTER_EPOCH_MS) / 1_000);
+  const seconds = TEST_FARCASTER_SECONDS;
   return {
     id,
     shardIndex: 7,
@@ -21,20 +27,24 @@ function mergeEvent(id: string, fid: string): RawHubEvent {
 class FakeRpc implements CollectorRpc {
   readonly info: NodeInfo = {
     version: "fake-snapchain/1",
+    peerId: "12D3KooWTestPrimaryPeerIdentity",
     numShards: 99,
     shardInfos: [{ shardId: 7, maxHeight: 100, blockDelay: 0, mempoolSize: 0xffff_ffff }]
   };
   readonly subscriptions: Array<{ emit(event: RawHubEvent): void; end(): void }> = [];
   readonly subscribeFromIds: Array<string | undefined> = [];
   subscribeCalls = 0;
+  cancelCalls = 0;
+  getEventCalls = 0;
   getEventsCalls: Array<{ shard: number; startId: string; stopId?: string }> = [];
 
   async getInfo(): Promise<NodeInfo> {
     return this.info;
   }
 
-  async getEvent(): Promise<RawHubEvent> {
-    return mergeEvent("1", "1");
+  async getEvent(_shard: number, id: string): Promise<RawHubEvent> {
+    this.getEventCalls += 1;
+    return mergeEvent(id, id);
   }
 
   async getEvents(shard: number, startId: string, _token?: Uint8Array, stopId?: string) {
@@ -51,7 +61,14 @@ class FakeRpc implements CollectorRpc {
     this.subscriptions.push(control);
     // Simulates a subscription event racing with initial historical replay.
     onEvent(mergeEvent("3", "3"));
-    return { cancel: control.end, ready: Promise.resolve(), done };
+    return {
+      cancel: () => {
+        this.cancelCalls += 1;
+        control.end();
+      },
+      ready: Promise.resolve(),
+      done
+    };
   }
 
   close(): void {}
@@ -79,7 +96,14 @@ class LiveOnlyRpc extends FakeRpc {
     const done = new Promise<void>((resolve) => { finish = resolve; });
     const control = { emit: onEvent, end: () => finish?.() };
     this.subscriptions.push(control);
-    return { cancel: control.end, ready: Promise.resolve(), done };
+    return {
+      cancel: () => {
+        this.cancelCalls += 1;
+        control.end();
+      },
+      ready: Promise.resolve(),
+      done
+    };
   }
 }
 
@@ -243,6 +267,48 @@ class PendingDiscoveryRpc implements CollectorRpc {
   }
 }
 
+class ToggleRpc extends LiveOnlyRpc {
+  available = true;
+  closed = false;
+  getInfoCalls = 0;
+
+  override async getInfo(): Promise<NodeInfo> {
+    this.getInfoCalls += 1;
+    if (!this.available) throw new Error("endpoint unavailable");
+    return this.info;
+  }
+
+  override close(): void {
+    this.closed = true;
+  }
+}
+
+class FailAfterFirstInfoRpc extends ToggleRpc {
+  override async getInfo(): Promise<NodeInfo> {
+    this.getInfoCalls += 1;
+    if (this.getInfoCalls > 1) throw new Error("active endpoint failed");
+    return this.info;
+  }
+}
+
+class DriftAfterOpenRpc extends ToggleRpc {
+  override async getInfo(): Promise<NodeInfo> {
+    this.getInfoCalls += 1;
+    if (this.getInfoCalls === 1) return this.info;
+    return {
+      ...this.info,
+      peerId: "12D3KooWChangedMidSessionPeer",
+      shardInfos: [{ shardId: 8, maxHeight: 100, blockDelay: 0, mempoolSize: 0 }]
+    };
+  }
+}
+
+class PersistentReplayFailureRpc extends ToggleRpc {
+  override async getEvents(): Promise<{ events: RawHubEvent[] }> {
+    throw new Error("persistent historical replay failure");
+  }
+}
+
 describe("collector runtime integration", () => {
   it("discovers only explicit positive data shards and normalizes event shard zero to its subscription", () => {
     expect(discoveredShardIds({
@@ -258,6 +324,295 @@ describe("collector runtime integration", () => {
     expect(rawEventShard({ shardIndex: 0 }, 8)).toBe(8);
     expect(rawEventShard({ shardIndex: 9 }, 8)).toBe(9);
     expect(() => rawEventShard({}, 0)).toThrow(/positive data shard/);
+  });
+
+  it("requires an exact, duplicate-free Hypersnap data-shard topology", () => {
+    const transport = loadConfig({ SNAPCHAIN_SOURCE_MODE: "unavailable" }).endpoints.hypersnap;
+    const shard = (shardId: number) => ({ shardId, maxHeight: 100, blockDelay: 0, mempoolSize: 0 });
+    const valid = { version: "0.13.4", peerId: "12D3KooWPeer", numShards: 2, shardInfos: [shard(0), shard(1), shard(2)] };
+    expect(() => validateCandidateInfo("hypersnap", transport, valid, 30)).not.toThrow();
+    expect(() => validateCandidateInfo("hypersnap", transport, { ...valid, shardInfos: [shard(0), shard(1)] }, 30))
+      .toThrow(/topology/);
+    expect(() => validateCandidateInfo("hypersnap", transport, { ...valid, shardInfos: [shard(0), shard(1), shard(2), shard(3)] }, 30))
+      .toThrow(/topology/);
+    expect(() => validateCandidateInfo("hypersnap", transport, { ...valid, shardInfos: [shard(0), shard(1), shard(1), shard(2)] }, 30))
+      .toThrow(/topology/);
+  });
+
+  it("activates the pinned HTTP fallback while local Hypersnap is unavailable", async () => {
+    const database = new CollectorDatabase(":memory:");
+    const primary = new ToggleRpc();
+    primary.available = false;
+    primary.info.numShards = 1;
+    const fallback = new ToggleRpc();
+    fallback.info.numShards = 1;
+    fallback.info.peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: fallback.info.peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: fallback.info.version
+    });
+    config.discoveryIntervalMs = 20;
+    config.pulseIntervalMs = 10;
+    const runtime = new CollectorRuntime({
+      config,
+      database,
+      rpcFactory: (candidate) => candidate.url.startsWith("https://") ? fallback : primary,
+      logger: createLogger({ write() {} }),
+      random: () => 0
+    });
+    const running = runtime.run();
+    try {
+      await waitFor(() => fallback.subscribeCalls > 0);
+      expect(primary.closed).toBe(true);
+      expect(database.sourceHealth("hypersnap")[0]).toMatchObject({
+        sourceMode: "derived",
+        node: { coveredShards: 1 }
+      });
+    } finally {
+      runtime.stop();
+      await running;
+      database.close();
+    }
+  });
+
+  it.each(["blank", "mismatch"] as const)("rejects a fallback with a %s durable cursor fingerprint", async (state) => {
+    const directory = mkdtempSync(join(tmpdir(), `snapmeter-fallback-${state}-test-`));
+    const path = join(directory, "state.sqlite3");
+    let database = new CollectorDatabase(path);
+    const stored = mergeEvent("1", "99");
+    database.recordEvent({
+      source: "hypersnap",
+      shard: 7,
+      eventId: "1",
+      eventType: "HUB_EVENT_TYPE_MERGE_MESSAGE",
+      eventFingerprint: rawHubEventFingerprint(stored, 7),
+      receivedAtMs: Date.now(),
+      activity: null
+    });
+    database.checkpointCursor("hypersnap", 7, "1", Date.now());
+    if (state === "blank") {
+      database.close();
+      const legacy = new DatabaseSync(path);
+      legacy.prepare("UPDATE event_dedupe SET event_fingerprint = '' WHERE source = 'hypersnap'").run();
+      legacy.close();
+      database = new CollectorDatabase(path);
+    }
+    const primary = new ToggleRpc();
+    primary.available = false;
+    primary.info.numShards = 1;
+    const fallback = new ToggleRpc();
+    fallback.info.numShards = 1;
+    fallback.info.peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: fallback.info.peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: fallback.info.version
+    });
+    config.discoveryIntervalMs = 10;
+    config.pulseIntervalMs = 10;
+    const runtime = new CollectorRuntime({
+      config,
+      database,
+      rpcFactory: (candidate) => candidate.url.startsWith("https://") ? fallback : primary,
+      logger: createLogger({ write() {} }),
+      random: () => 0
+    });
+    const running = runtime.run();
+    try {
+      await waitFor(() => fallback.getInfoCalls > 0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(fallback.subscribeCalls).toBe(0);
+      expect(fallback.getEventCalls).toBeGreaterThan(0);
+    } finally {
+      runtime.stop();
+      await running;
+      database.close();
+      const resolved = resolve(directory);
+      if (resolved.startsWith(resolve(tmpdir()))) rmSync(resolved, { recursive: true, force: true });
+    }
+  });
+
+  it("switches the complete source session to fallback after repeated active-endpoint failure", async () => {
+    const database = new CollectorDatabase(":memory:");
+    const primary = new FailAfterFirstInfoRpc();
+    primary.info.numShards = 1;
+    const fallback = new ToggleRpc();
+    fallback.info.numShards = 1;
+    fallback.info.peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: fallback.info.peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: fallback.info.version,
+      HYPERSNAP_FAILOVER_AFTER_FAILURES: "1"
+    });
+    config.discoveryIntervalMs = 20;
+    config.pulseIntervalMs = 10;
+    const cursorEvent = mergeEvent("1", "1");
+    database.recordEvent({
+      source: "hypersnap",
+      shard: 7,
+      eventId: "1",
+      eventType: "HUB_EVENT_TYPE_MERGE_MESSAGE",
+      eventFingerprint: rawHubEventFingerprint(cursorEvent, 7),
+      receivedAtMs: Date.now(),
+      activity: null
+    });
+    database.checkpointCursor("hypersnap", 7, "1", Date.now());
+    const runtime = new CollectorRuntime({
+      config,
+      database,
+      rpcFactory: (candidate) => candidate.url.startsWith("https://") ? fallback : primary,
+      logger: createLogger({ write() {} }),
+      random: () => 0
+    });
+    const running = runtime.run();
+    try {
+      await waitFor(() => fallback.subscribeCalls > 0);
+      expect(primary.closed).toBe(true);
+      expect(primary.subscriptions.length).toBe(1);
+      expect(primary.cancelCalls).toBeGreaterThan(0);
+      expect(fallback.getEventsCalls.some((call) => call.startId === "1")).toBe(true);
+      expect(database.eventFingerprint("hypersnap", 7, "1")).toBe(rawHubEventFingerprint(cursorEvent, 7));
+    } finally {
+      runtime.stop();
+      await running;
+      database.close();
+    }
+  });
+
+  it("quarantines a mid-session identity and shard-set drift before activating new workers", async () => {
+    const database = new CollectorDatabase(":memory:");
+    const primary = new DriftAfterOpenRpc();
+    primary.info.numShards = 1;
+    const fallback = new ToggleRpc();
+    fallback.info.numShards = 1;
+    fallback.info.peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: fallback.info.peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: fallback.info.version,
+      HYPERSNAP_FAILOVER_AFTER_FAILURES: "3"
+    });
+    config.discoveryIntervalMs = 10;
+    config.pulseIntervalMs = 10;
+    const runtime = new CollectorRuntime({
+      config,
+      database,
+      rpcFactory: (candidate) => candidate.url.startsWith("https://") ? fallback : primary,
+      logger: createLogger({ write() {} }),
+      random: () => 0
+    });
+    const running = runtime.run();
+    try {
+      await waitFor(() => fallback.subscribeCalls > 0);
+      expect(primary.getInfoCalls).toBe(2);
+      expect(primary.subscribeCalls).toBe(1);
+      expect(primary.cancelCalls).toBeGreaterThan(0);
+      expect(primary.closed).toBe(true);
+    } finally {
+      runtime.stop();
+      await running;
+      database.close();
+    }
+  });
+
+  it("switches the whole source when GetInfo stays healthy but shard replay repeatedly fails", async () => {
+    const database = new CollectorDatabase(":memory:");
+    const primary = new PersistentReplayFailureRpc();
+    primary.info.numShards = 1;
+    const fallback = new ToggleRpc();
+    fallback.info.numShards = 1;
+    fallback.info.peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: fallback.info.peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: fallback.info.version,
+      HYPERSNAP_FAILOVER_AFTER_FAILURES: "2"
+    });
+    config.discoveryIntervalMs = 10;
+    config.pulseIntervalMs = 10;
+    const runtime = new CollectorRuntime({
+      config,
+      database,
+      rpcFactory: (candidate) => candidate.url.startsWith("https://") ? fallback : primary,
+      logger: createLogger({ write() {} }),
+      random: () => 0
+    });
+    const running = runtime.run();
+    try {
+      await waitFor(() => fallback.subscribeCalls > 0);
+      expect(primary.getInfoCalls).toBeGreaterThan(1);
+      expect(primary.subscribeCalls).toBeGreaterThanOrEqual(2);
+      expect(primary.cancelCalls).toBeGreaterThanOrEqual(2);
+      expect(primary.closed).toBe(true);
+    } finally {
+      runtime.stop();
+      await running;
+      database.close();
+    }
+  });
+
+  it("fails back to the preferred local endpoint only after stable compatible probes", async () => {
+    const database = new CollectorDatabase(":memory:");
+    let primaryAvailable = false;
+    const primaryInstances: ToggleRpc[] = [];
+    const fallback = new ToggleRpc();
+    fallback.info.numShards = 1;
+    fallback.info.peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: fallback.info.peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: fallback.info.version,
+      HYPERSNAP_PREFERRED_RECOVERY_SUCCESSES: "2"
+    });
+    config.discoveryIntervalMs = 10;
+    config.endpoints.hypersnap.preferredRecoveryIntervalMs = 10;
+    config.pulseIntervalMs = 10;
+    const cursorEvent = mergeEvent("1", "1");
+    database.recordEvent({
+      source: "hypersnap",
+      shard: 7,
+      eventId: "1",
+      eventType: "HUB_EVENT_TYPE_MERGE_MESSAGE",
+      eventFingerprint: rawHubEventFingerprint(cursorEvent, 7),
+      receivedAtMs: Date.now(),
+      activity: null
+    });
+    database.checkpointCursor("hypersnap", 7, "1", Date.now());
+    const runtime = new CollectorRuntime({
+      config,
+      database,
+      rpcFactory: (candidate) => {
+        if (candidate.url.startsWith("https://")) return fallback;
+        const rpc = new ToggleRpc();
+        rpc.available = primaryAvailable;
+        rpc.info.numShards = 1;
+        primaryInstances.push(rpc);
+        return rpc;
+      },
+      logger: createLogger({ write() {} }),
+      random: () => 0
+    });
+    const running = runtime.run();
+    try {
+      await waitFor(() => fallback.subscribeCalls > 0);
+      primaryAvailable = true;
+      await waitFor(() => primaryInstances.some((rpc) => rpc.subscribeCalls > 0));
+      expect(fallback.closed).toBe(true);
+      expect(fallback.cancelCalls).toBeGreaterThan(0);
+      expect(primaryInstances.filter((rpc) => rpc.getInfoCalls > 0).length).toBeGreaterThanOrEqual(3);
+    } finally {
+      runtime.stop();
+      await running;
+      database.close();
+    }
   });
 
   it("discovers a nonzero shard, catches up transactionally, and later advances after fixed-bound reconciliation", async () => {

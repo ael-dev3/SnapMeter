@@ -52,7 +52,23 @@ foreach ($source in @(
 )) {
     $endpoint = Get-SnapMeterEndpoint -Value $source.Value
     $reachable = Test-NetConnection -ComputerName $endpoint.Host -Port $endpoint.Port -InformationLevel Quiet -WarningAction SilentlyContinue
-    Write-Host ("{0} TCP probe: {1}" -f $source.Name, $(if ($reachable) { 'reachable' } else { 'not reachable; doctor will report source unavailable' }))
+    $unreachableMessage = if ($source.Name -eq 'Hypersnap' -and -not [string]::IsNullOrWhiteSpace($env:HYPERSNAP_FALLBACK_HTTP_URL)) {
+        'not reachable; doctor will try the configured HTTPS fallback'
+    } else {
+        'not reachable; doctor will report source unavailable'
+    }
+    Write-Host ("{0} TCP probe: {1}" -f $source.Name, $(if ($reachable) { 'reachable' } else { $unreachableMessage }))
+}
+
+if (-not [string]::IsNullOrWhiteSpace($env:HYPERSNAP_FALLBACK_HTTP_URL)) {
+    try {
+        $fallbackInfoUri = Get-SnapMeterHypersnapInfoUri -Value $env:HYPERSNAP_FALLBACK_HTTP_URL
+        $fallbackResponse = Invoke-WebRequest -Uri $fallbackInfoUri -Method Get -Headers @{ Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 15 -UseBasicParsing
+        $fallbackReachable = $fallbackResponse.StatusCode -ge 200 -and $fallbackResponse.StatusCode -lt 300
+        Write-Host ("Hypersnap HTTPS fallback probe: {0}" -f $(if ($fallbackReachable) { 'reachable' } else { 'not reachable; doctor will report compatibility details' }))
+    } catch {
+        Write-Host 'Hypersnap HTTPS fallback probe: not reachable; doctor will report compatibility details'
+    }
 }
 
 $lockFile = Join-Path $repositoryRoot 'pnpm-lock.yaml'

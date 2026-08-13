@@ -1,4 +1,6 @@
 import { SnapchainRpcClient, type NodeInfo, type RawHubEvent, type RpcConfig } from "@snapmeter/protocol";
+import type { RpcTransportConfig } from "./config.js";
+import { HypersnapHttpRpc } from "./hypersnap-http-rpc.js";
 
 export interface RpcSubscription {
   cancel(): void;
@@ -25,9 +27,21 @@ export interface CollectorRpc {
   close(): void;
 }
 
-export type RpcFactory = (config: RpcConfig) => CollectorRpc;
+export type RpcFactory = (config: RpcTransportConfig) => CollectorRpc;
 
-export const defaultRpcFactory: RpcFactory = (config) => new ProtocolRpcAdapter(new SnapchainRpcClient(config));
+export const defaultRpcFactory: RpcFactory = (config) => {
+  if (config.transport === "https-json") {
+    if (config.authorization || config.apiKey) throw new Error("Hypersnap HTTP public reads do not accept collector credentials");
+    return new HypersnapHttpRpc({
+      baseUrl: config.url,
+      expectedPeerId: config.expectedPeerId,
+      timeoutMs: config.timeoutMs,
+      pollIntervalMs: config.pollIntervalMs,
+      minimumIntervalMs: config.getEventsMinIntervalMs
+    });
+  }
+  return new ProtocolRpcAdapter(new SnapchainRpcClient(config as RpcConfig));
+};
 
 class ProtocolRpcAdapter implements CollectorRpc {
   constructor(readonly client: SnapchainRpcClient) {}

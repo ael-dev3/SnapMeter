@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, statfsSync } from "node:fs";
 import { IngestBatchSchema, SCHEMA_VERSION, signIngest, type IngestBatch, type Source } from "@snapmeter/contracts";
-import { FARCASTER_EPOCH_MS, HYPERSNAP_UPSTREAM_SHA, SNAPCHAIN_UPSTREAM_SHA } from "@snapmeter/protocol";
-import type { CollectorConfig } from "./config.js";
+import { FARCASTER_EPOCH_MS, HYPERSNAP_UPSTREAM_SHA, SNAPCHAIN_UPSTREAM_SHA, rawHubEventFingerprint, type NodeInfo } from "@snapmeter/protocol";
+import type { CollectorConfig, RpcEndpointConfig, RpcTransportConfig } from "./config.js";
 import { CollectorDatabase } from "./database.js";
 import type { FetchLike } from "./delivery.js";
-import { defaultRpcFactory, type RpcFactory } from "./rpc.js";
-import { discoveredShardIds } from "./collector.js";
+import { defaultRpcFactory, rawEventId, rawEventShard, type CollectorRpc, type RpcFactory } from "./rpc.js";
+import { discoveredShardIds, validateCandidateInfo } from "./collector.js";
 
 export type CheckStatus = "pass" | "warn" | "fail" | "skipped";
 
@@ -58,9 +58,19 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
       checks.push({ name: `${source}.rpc`, status: "skipped", message: "source is explicitly unavailable" });
       continue;
     }
-    const rpc = rpcFactory(endpoint);
+    let selected: DoctorEndpoint;
     try {
-      const info = await rpc.getInfo();
+      selected = await selectDoctorEndpoint(source, endpoint, options.database, rpcFactory);
+    } catch {
+      checks.push({
+        name: `${source}.rpc`,
+        status: "fail",
+        message: "no configured endpoint passed identity, health, and cursor-continuity checks"
+      });
+      continue;
+    }
+    const { rpc, info, role, transport } = selected;
+    try {
       const shards = discoveredShardIds(info);
       expectedShards.set(source, shards);
       checks.push({
@@ -69,7 +79,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
         message: info.version && shards.length > 0
           ? `GetInfo succeeded; discovered ${shards.length} shard(s)`
           : "GetInfo returned an incompatible response",
-        details: { endpoint: endpoint.url, tls: endpoint.tls, version: info.version, shards }
+        details: { role, transport: transport.transport, tls: transport.tls, version: info.version, shards }
       });
       checks.push({
         name: `${source}.shards`,
@@ -131,16 +141,16 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
           } else {
             checks.push({ name: `${source}.clock`, status: "warn", message: "no near-head event timestamp was available for a clock comparison" });
           }
-        } catch (error) {
-          checks.push({ name: `${source}.protocol`, status: "fail", message: errorMessage(error) });
+        } catch {
+          checks.push({ name: `${source}.protocol`, status: "fail", message: "the selected endpoint failed the event protocol probe" });
         }
       }
-    } catch (error) {
+    } catch {
       checks.push({
         name: `${source}.rpc`,
         status: "fail",
-        message: errorMessage(error),
-        details: { endpoint: endpoint.url, tls: endpoint.tls }
+        message: "the selected endpoint failed a bounded protocol check",
+        details: { role, transport: transport.transport }
       });
     } finally {
       rpc.close();
@@ -165,6 +175,67 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     upstream: { snapchain: SNAPCHAIN_UPSTREAM_SHA, hypersnap: HYPERSNAP_UPSTREAM_SHA },
     checks
   };
+}
+
+interface DoctorEndpoint {
+  role: "primary" | "fallback";
+  transport: RpcTransportConfig;
+  rpc: CollectorRpc;
+  info: NodeInfo;
+}
+
+async function selectDoctorEndpoint(
+  source: Source,
+  endpoint: RpcEndpointConfig,
+  database: CollectorDatabase,
+  rpcFactory: RpcFactory
+): Promise<DoctorEndpoint> {
+  for (const role of ["primary", "fallback"] as const) {
+    const transport = role === "primary" ? endpoint : endpoint.fallback;
+    if (!transport) continue;
+    const rpc = rpcFactory(transport);
+    try {
+      const info = await rpc.getInfo();
+      const shards = discoveredShardIds(info);
+      if (!info.version || shards.length === 0) throw new Error("incompatible GetInfo response");
+      if (transport.expectedPeerId && info.peerId !== transport.expectedPeerId) throw new Error("peer identity mismatch");
+      if (transport.expectedVersion && info.version !== transport.expectedVersion) throw new Error("version mismatch");
+      if (source === "hypersnap") {
+        validateCandidateInfo(source, transport, info, endpoint.maximumBlockDelaySeconds);
+        if (!info.peerId) throw new Error("Hypersnap endpoint did not expose a peer identity");
+        const advertised = new Set(shards);
+        for (const cursor of database.getCursors().filter((item) => item.source === source)) {
+          if (!advertised.has(cursor.shard)) throw new Error("candidate endpoint is missing a durable cursor shard");
+          const known = database.eventFingerprint(source, cursor.shard, cursor.eventId);
+          if (role === "fallback" && known === null) throw new Error("fallback cursor fingerprint is not enrolled");
+          const point = await rpc.getEvent(cursor.shard, cursor.eventId);
+          if (rawEventId(point) !== cursor.eventId
+            || rawEventShard(point, cursor.shard) !== cursor.shard
+            || (known !== null && rawHubEventFingerprint(point, cursor.shard) !== known)) {
+            throw new Error(`${role} cursor continuity mismatch`);
+          }
+        }
+        database.checkSourceEndpointEnrollment({
+          source,
+          role,
+          transport: transport.transport,
+          canonicalUrl: canonicalTransportUrl(transport),
+          peerId: info.peerId,
+          version: info.version,
+          shardIds: shards
+        });
+      }
+      return { role, transport, rpc, info };
+    } catch {
+      rpc.close();
+    }
+  }
+  throw new Error(`no compatible ${source} endpoint`);
+}
+
+function canonicalTransportUrl(transport: RpcTransportConfig): string {
+  if (transport.transport === "https-json") return new URL(transport.url).toString();
+  return transport.url.toLowerCase();
 }
 
 function databaseCheck(database: CollectorDatabase, nowMs: number): DoctorCheck {

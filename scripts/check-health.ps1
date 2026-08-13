@@ -15,16 +15,36 @@ Test-SnapMeterConfiguration
 $pnpmPath = Get-SnapMeterCommandPath -Names @('pnpm.cmd', 'pnpm')
 
 $failures = [System.Collections.Generic.List[string]]::new()
-foreach ($source in @(
-    @{ Name = 'Snapchain'; Value = $env:SNAPCHAIN_GRPC_URL },
-    @{ Name = 'Hypersnap'; Value = $env:HYPERSNAP_GRPC_URL }
-)) {
-    $endpoint = Get-SnapMeterEndpoint -Value $source.Value
-    $reachable = Test-NetConnection -ComputerName $endpoint.Host -Port $endpoint.Port -InformationLevel Quiet -WarningAction SilentlyContinue
-    Write-Host ("{0} TCP: {1}" -f $source.Name, $(if ($reachable) { 'reachable' } else { 'unreachable' }))
-    if (-not $reachable) {
-        $failures.Add("$($source.Name) TCP endpoint is unreachable")
+
+$snapchainEndpoint = Get-SnapMeterEndpoint -Value $env:SNAPCHAIN_GRPC_URL
+$snapchainReachable = Test-NetConnection -ComputerName $snapchainEndpoint.Host -Port $snapchainEndpoint.Port -InformationLevel Quiet -WarningAction SilentlyContinue
+Write-Host ("Snapchain TCP: {0}" -f $(if ($snapchainReachable) { 'reachable' } else { 'unreachable' }))
+if (-not $snapchainReachable -and $env:SNAPCHAIN_SOURCE_MODE -ne 'unavailable') {
+    $failures.Add('Snapchain TCP endpoint is unreachable')
+}
+
+$hypersnapEndpoint = Get-SnapMeterEndpoint -Value $env:HYPERSNAP_GRPC_URL
+$hypersnapPrimaryReachable = Test-NetConnection -ComputerName $hypersnapEndpoint.Host -Port $hypersnapEndpoint.Port -InformationLevel Quiet -WarningAction SilentlyContinue
+Write-Host ("Hypersnap primary TCP: {0}" -f $(if ($hypersnapPrimaryReachable) { 'reachable' } else { 'unreachable' }))
+
+$hypersnapFallbackConfigured = -not [string]::IsNullOrWhiteSpace($env:HYPERSNAP_FALLBACK_HTTP_URL)
+$hypersnapFallbackReachable = $false
+if ($hypersnapFallbackConfigured) {
+    try {
+        $fallbackInfoUri = Get-SnapMeterHypersnapInfoUri -Value $env:HYPERSNAP_FALLBACK_HTTP_URL
+        $fallbackResponse = Invoke-WebRequest -Uri $fallbackInfoUri -Method Get -Headers @{ Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 15 -UseBasicParsing
+        $hypersnapFallbackReachable = $fallbackResponse.StatusCode -ge 200 -and $fallbackResponse.StatusCode -lt 300
+    } catch {
+        $hypersnapFallbackReachable = $false
     }
+    Write-Host ("Hypersnap HTTPS fallback: {0}" -f $(if ($hypersnapFallbackReachable) { 'reachable' } else { 'unreachable' }))
+}
+
+$hypersnapMode = if ([string]::IsNullOrWhiteSpace($env:HYPERSNAP_SOURCE_MODE)) { 'derived' } else { $env:HYPERSNAP_SOURCE_MODE.ToLowerInvariant() }
+if ($hypersnapMode -ne 'unavailable' -and -not $hypersnapPrimaryReachable -and -not $hypersnapFallbackReachable) {
+    $failures.Add('No reachable Hypersnap primary or HTTPS fallback was found')
+} elseif ($hypersnapFallbackConfigured -and -not $hypersnapFallbackReachable) {
+    Write-Warning 'Hypersnap fallback is unreachable; collection can continue only while the preferred endpoint remains healthy.'
 }
 
 Push-Location $repositoryRoot
