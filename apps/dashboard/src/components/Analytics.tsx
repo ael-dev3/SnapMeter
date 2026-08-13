@@ -76,6 +76,20 @@ function Freshness({ sources, now }: { sources: Summary["sources"]; now: number 
   );
 }
 
+function sharedActionWindowEnd(sources: Summary["sources"]): number | null {
+  return sources.snapchain.updatedAtMs === sources.hypersnap.updatedAtMs
+    ? sources.snapchain.updatedAtMs
+    : null;
+}
+
+function utcTimestamp(value: number): string {
+  return new Date(value).toLocaleString("en-GB", {
+    timeZone: "UTC",
+    dateStyle: "medium",
+    timeStyle: "medium"
+  });
+}
+
 export function Analytics({ summary, now }: { summary: Summary; now: number }): React.JSX.Element {
   const [range, setRange] = useState<Range>("30D");
   const series = useMemo(() => [
@@ -84,6 +98,10 @@ export function Analytics({ summary, now }: { summary: Summary; now: number }): 
   ], [range, summary]);
   const latestSnap = series[0]?.points.at(-1)?.value ?? 0;
   const latestHyper = series[1]?.points.at(-1)?.value ?? 0;
+  const actionWindowEndMs = sharedActionWindowEnd(summary.sources);
+  const sharedRangeLabel = range === "24H"
+    ? "Latest two UTC DAU samples · both sources"
+    : `${range} UTC daily DAU · both sources`;
 
   return (
     <main className="analytics" id="analytics">
@@ -91,34 +109,37 @@ export function Analytics({ summary, now }: { summary: Summary; now: number }): 
         <div>
           <p className="section-kicker">History / comparison</p>
           <h2>Signal below the pulse</h2>
-          <p>Exact UTC actor windows, source quality, and the operational context behind each number.</p>
+          <p>DAU is measured as unique active FIDs. Every comparison uses one shared UTC timeframe for Snapchain and Hypersnap.</p>
         </div>
-        <div className="range-control" role="group" aria-label="Chart range">
-          {(["24H", "7D", "30D"] as Range[]).map((option) => (
-            <button
-              type="button"
-              key={option}
-              aria-pressed={range === option}
-              onClick={() => setRange(option)}
-            >{option}</button>
-          ))}
+        <div className="range-stack">
+          <p className="range-context">Shared DAU timeframe · both sources</p>
+          <div className="range-control" role="group" aria-label="Shared DAU timeframe for Snapchain and Hypersnap">
+            {(["24H", "7D", "30D"] as Range[]).map((option) => (
+              <button
+                type="button"
+                key={option}
+                aria-pressed={range === option}
+                onClick={() => setRange(option)}
+              >{option}</button>
+            ))}
+          </div>
         </div>
       </header>
 
       <section className="comparison-band" aria-labelledby="comparison-title">
         <div className="band-heading">
-          <div><span className="index-number">01</span><div><h3 id="comparison-title">Two-source comparison</h3><p>{range === "24H" ? "Latest two UTC samples" : `${range} UTC daily active FIDs`}</p></div></div>
+          <div><span className="index-number">01</span><div><h3 id="comparison-title">Two-source DAU comparison</h3><p>{sharedRangeLabel}</p></div></div>
           <div className="legend"><span className="legend-snap">Snapchain</span><span className="legend-hyper">Hypersnap</span></div>
         </div>
         <InteractiveChart id="comparison-chart" series={series} />
         <div className="chart-foot">
-          <p><strong>{exact(latestSnap - latestHyper)}</strong> latest-sample difference</p>
+          <p><strong>{exact(latestSnap - latestHyper)}</strong> latest-sample DAU difference</p>
           <p>{summary.comparison.effectivelyIdentical ? "Sources are effectively identical in the compared window." : summary.comparison.explanation}</p>
         </div>
       </section>
 
       <section className="comparison-facts" aria-label="Comparison integrity">
-        <div><span>24h active-FID overlap <InfoTip label="Define active FID overlap">FIDs observed by both sources during the same rolling 24-hour window.</InfoTip></span><strong>{summary.comparison.overlapPercent === null ? "Unavailable" : `${summary.comparison.overlapPercent.toFixed(1)}%`}</strong><small>{summary.comparison.overlap24h === null ? "No shared membership data" : `${exact(summary.comparison.overlap24h)} FIDs shared`}</small></div>
+        <div><span>Rolling 24h DAU overlap <InfoTip label="Define DAU overlap">Active FIDs observed by both sources during the same rolling 24-hour UTC window.</InfoTip></span><strong>{summary.comparison.overlapPercent === null ? "Unavailable" : `${summary.comparison.overlapPercent.toFixed(1)}%`}</strong><small>{summary.comparison.overlap24h === null ? "No shared membership data" : `${exact(summary.comparison.overlap24h)} active FIDs shared`}</small></div>
         <div><span>Hyper-eligible coverage</span><strong>{summary.comparison.eligibleActionCoveragePercent === null ? "Unavailable" : `${summary.comparison.eligibleActionCoveragePercent.toFixed(1)}%`}</strong><small>Eligible canonical actions observed</small></div>
         <div><span>Event-count parity</span><strong>{summary.comparison.eventParityPercent === null ? "Unavailable" : `${summary.comparison.eventParityPercent.toFixed(1)}%`}</strong><small>Not a growth contest</small></div>
       </section>
@@ -132,7 +153,7 @@ export function Analytics({ summary, now }: { summary: Summary; now: number }): 
         <div className="trend-pair">
           {[summary.sources.snapchain, summary.sources.hypersnap].map((metrics) => (
             <div key={metrics.source}>
-              <span>{titleCase(metrics.source)} · 7d average</span>
+              <span>{titleCase(metrics.source)} · 7d DAU average</span>
               <strong>{exact(metrics.trend.currentSevenDayAverage)}</strong>
               <small className={`trend-${metrics.trend.label.toLowerCase().replaceAll(" ", "-")}`}>{metrics.trend.label} · {percent(metrics.trend.percentChange)}</small>
             </div>
@@ -142,8 +163,12 @@ export function Analytics({ summary, now }: { summary: Summary; now: number }): 
 
       <section className="split-analysis">
         <div className="analysis-half action-half">
-          <div className="band-heading compact-heading"><div><span className="index-number">03</span><div><h3>Qualifying action mix</h3><p>Exact classified action totals</p></div></div></div>
-          <ActionMix snapchain={summary.sources.snapchain} hypersnap={summary.sources.hypersnap} />
+          <div className="band-heading compact-heading"><div><span className="index-number">03</span><div><h3>Qualifying action mix</h3><p>{actionWindowEndMs === null ? "Shared rolling 24h window unavailable" : `Shared rolling 24h · both sources · ending ${utcTimestamp(actionWindowEndMs)} UTC`}</p></div></div></div>
+          {actionWindowEndMs === null ? (
+            <p className="window-unavailable" role="status">Action mix withheld because the Snapchain and Hypersnap source windows end at different times.</p>
+          ) : (
+            <ActionMix snapchain={summary.sources.snapchain} hypersnap={summary.sources.hypersnap} />
+          )}
         </div>
         <div className="analysis-half freshness-half">
           <div className="band-heading compact-heading"><div><span className="index-number">04</span><div><h3>Freshness / latency</h3><p>Collector-to-dashboard delivery</p></div></div></div>
@@ -161,10 +186,10 @@ export function Analytics({ summary, now }: { summary: Summary; now: number }): 
         <div>
           <p className="section-kicker">Metric contract</p>
           <h3 id="definitions-title">Definitions, not vibes.</h3>
-          <p>UTC is the time authority. Successful user-originated canonical message merges qualify; replay, pruning, failures, maintenance, and block confirmation alone do not.</p>
+          <p>The primary outcome is DAU, represented by unique active FIDs. UTC is the time authority. Successful user-originated canonical message merges qualify; replay, pruning, failures, maintenance, and block confirmation alone do not.</p>
         </div>
         <dl className="definitions-list">
-          <div><dt>Rolling 24h active</dt><dd>Unique valid FIDs in (now − 24h, now]. Compared with the immediately preceding 24h.</dd></div>
+          <div><dt>Rolling 24h DAU</dt><dd>Unique valid active FIDs in (now − 24h, now]. Compared with the immediately preceding 24h.</dd></div>
           <div><dt>Today UTC DAU</dt><dd>Unique qualifying FIDs since 00:00 UTC. This is a calendar-day metric, not rolling 24h.</dd></div>
           <div><dt>30d active</dt><dd>Unique qualifying FIDs in (now − 30 days, now]. It is deliberately not labelled “30d DAU.”</dd></div>
           <div><dt>Hypersnap observed</dt><dd>When marked Derived, inferred from Hyper-eligible canonical merges observed by the Hypersnap node.</dd></div>

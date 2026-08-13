@@ -82,7 +82,7 @@ describe("live dashboard transport", () => {
     };
 
     act(() => socket.receive(pulse));
-    expect(result.current.pulses.snapchain).toMatchObject({ id: 1, count: 12 });
+    expect(result.current.pulses.snapchain).toMatchObject({ id: 1, count: 12, lastActionAtMs: 1_200 });
     act(() => socket.receive(pulse));
     expect(result.current.pulses.snapchain.id).toBe(1);
     act(() => socket.receive({ ...pulse, sequence: 8, data: { ...pulse.data, eventCount: 3 } }));
@@ -91,6 +91,24 @@ describe("live dashboard transport", () => {
     expect(result.current.pulses.snapchain.id).toBe(1);
     act(() => socket.receive({ ...pulse, sequence: 10, deliveryId: "00000000-0000-4000-8000-000000000002:pulse:0", deliveryIds: undefined, data: { ...pulse.data, eventCount: 3 } }));
     expect(result.current.pulses.snapchain).toMatchObject({ id: 2, count: 3 });
+
+    const metricWindowEnd = result.current.summary!.sources.snapchain.updatedAtMs;
+    act(() => socket.receive({
+      type: "status",
+      schemaVersion: 1,
+      sequence: 11,
+      deliveryId: "00000000-0000-4000-8000-000000000002:status:0",
+      data: {
+        schemaVersion: 1,
+        source: "snapchain",
+        sourceMode: "verified",
+        status: "partial",
+        observedAtMs: metricWindowEnd + 5_000,
+        node: result.current.summary!.sources.snapchain.node,
+        message: null
+      }
+    }));
+    expect(result.current.summary!.sources.snapchain.updatedAtMs).toBe(metricWindowEnd);
   });
 
   it("never substitutes demo data after a server failure", async () => {

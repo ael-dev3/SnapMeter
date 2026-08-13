@@ -6,8 +6,10 @@ export interface RpcEndpointConfig {
   url: string;
   tls: boolean;
   authorization?: string;
+  apiKey?: string;
   sourceMode: SourceMode;
   timeoutMs: number;
+  getEventsMinIntervalMs: number;
 }
 
 export interface CollectorConfig {
@@ -35,12 +37,13 @@ export interface EnvironmentLike {
 }
 
 const DEFAULT_LOCAL_DATA = join(homedir(), "AppData", "Local");
+const MAX_CREDENTIAL_LENGTH = 8 * 1024;
 
 export function loadConfig(env: EnvironmentLike = process.env): CollectorConfig {
   const localAppData = clean(env.LOCALAPPDATA) ?? DEFAULT_LOCAL_DATA;
   const dataDir = resolve(clean(env.SNAPMETER_DATA_DIR) ?? join(localAppData, "SnapMeter"));
   const ingestUrl = optionalHttpUrl(env.SNAPMETER_INGEST_URL, "SNAPMETER_INGEST_URL");
-  const ingestSecret = clean(env.SNAPMETER_INGEST_SECRET);
+  const ingestSecret = optionalCredential(env.SNAPMETER_INGEST_SECRET, "SNAPMETER_INGEST_SECRET");
   if ((ingestUrl === undefined) !== (ingestSecret === undefined)) {
     throw new Error("SNAPMETER_INGEST_URL and SNAPMETER_INGEST_SECRET must be configured together");
   }
@@ -81,10 +84,18 @@ function endpoint(
   timeoutMs: number
 ): RpcEndpointConfig {
   const url = clean(env[`${prefix}_GRPC_URL`]) ?? defaultUrl;
-  if (url.includes("://") || !/^(?:\[[^\]]+\]|[^:\s]+):\d{1,5}$/.test(url)) {
+  const endpointMatch = /^(?:\[([^\]\s]+)\]|([^:\s]+)):(\d{1,5})$/.exec(url);
+  const host = endpointMatch?.[1] ?? endpointMatch?.[2] ?? "";
+  if (
+    url.length > 512
+    || url.includes("://")
+    || endpointMatch === null
+    || /[/\\@?#]/.test(host)
+    || hasControlCharacters(host)
+  ) {
     throw new Error(`${prefix}_GRPC_URL must be host:port without a scheme`);
   }
-  const port = Number(url.slice(url.lastIndexOf(":") + 1));
+  const port = Number(endpointMatch[3]);
   if (port < 1 || port > 65_535) throw new Error(`${prefix}_GRPC_URL has an invalid port`);
   const sourceMode = sourceModeValue(env[`${prefix}_SOURCE_MODE`], defaultMode, `${prefix}_SOURCE_MODE`);
   if (prefix === "HYPERSNAP" && sourceMode === "verified") {
@@ -93,12 +104,26 @@ function endpoint(
   if (prefix === "SNAPCHAIN" && sourceMode === "derived") {
     throw new Error("SNAPCHAIN_SOURCE_MODE must be verified or unavailable; canonical Snapchain merges are not a derived source");
   }
+  const tls = booleanValue(env[`${prefix}_GRPC_TLS`], false, `${prefix}_GRPC_TLS`);
+  const authorization = optionalCredential(env[`${prefix}_GRPC_AUTHORIZATION`], `${prefix}_GRPC_AUTHORIZATION`);
+  const apiKey = optionalCredential(env[`${prefix}_GRPC_API_KEY`], `${prefix}_GRPC_API_KEY`);
+  if (!tls && !isLoopbackHost(host) && (authorization !== undefined || apiKey !== undefined)) {
+    throw new Error(`${prefix}_GRPC_TLS must be true when credentials are configured for a non-loopback endpoint`);
+  }
   return {
     url,
-    tls: booleanValue(env[`${prefix}_GRPC_TLS`], false, `${prefix}_GRPC_TLS`),
-    authorization: clean(env[`${prefix}_GRPC_AUTHORIZATION`]),
+    tls,
+    authorization,
+    apiKey,
     sourceMode,
-    timeoutMs
+    timeoutMs,
+    getEventsMinIntervalMs: integer(
+      env[`${prefix}_RPC_MIN_INTERVAL_MS`],
+      0,
+      0,
+      3_600_000,
+      `${prefix}_RPC_MIN_INTERVAL_MS`
+    )
   };
 }
 
@@ -118,8 +143,37 @@ function optionalHttpUrl(value: string | undefined, name: string): string | unde
   } catch {
     throw new Error(`${name} must be an absolute HTTP(S) URL`);
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error(`${name} must use HTTP(S)`);
+  if (parsed.username || parsed.password) throw new Error(`${name} must not contain credentials`);
+  if (parsed.search || parsed.hash) throw new Error(`${name} must not contain a query string or fragment`);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopbackHost(parsed.hostname))) {
+    throw new Error(`${name} must use HTTPS except for an explicit loopback development endpoint`);
+  }
   return parsed.toString();
+}
+
+function optionalCredential(value: string | undefined, name: string): string | undefined {
+  const normalized = clean(value);
+  if (normalized === undefined) return undefined;
+  if (normalized.length > MAX_CREDENTIAL_LENGTH || hasControlCharacters(normalized)) {
+    throw new Error(`${name} contains unsupported control characters or is too long`);
+  }
+  return normalized;
+}
+
+function isLoopbackHost(value: string): boolean {
+  const host = value.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
+  const ipv4 = /^(\d{1,3})(?:\.(\d{1,3})){3}$/.exec(host);
+  if (!ipv4 || Number(ipv4[1]) !== 127) return false;
+  return host.split(".").every((part) => Number(part) <= 255);
+}
+
+function hasControlCharacters(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || code === 127) return true;
+  }
+  return false;
 }
 
 function booleanValue(value: string | undefined, fallback: boolean, name: string): boolean {

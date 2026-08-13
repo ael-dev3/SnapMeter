@@ -68,8 +68,11 @@ For a set of valid, deduplicated actions `A` and evaluation time `t`:
 - **Active FIDs 5m:** unique FIDs with `t - 5m < actionAt <= t`.
 - **Actions/minute 1m:** qualifying action count in the latest minute.
 - **Actions/minute 5m:** qualifying action count in the latest five minutes divided by five.
+- **Qualifying action mix:** qualifying action count grouped by action family in the same exact rolling 24-hour window used for the rolling active-FID metric.
 
 The same FID is counted once per unique-FID window regardless of action count. It can appear once in each source because sources measure observations through distinct configured nodes. Never add two source totals and call the result network-wide unique activity without actor-level union data.
+
+Snapchain and Hypersnap snapshots in a comparison batch use one shared evaluation time `t`. The dashboard may compare their rolling metrics and action mix only when both source snapshots have that same window end; it must label or withhold a mismatched comparison rather than silently compare different periods. “Today UTC DAU” is the UTC calendar-day measure. “Rolling 24h active” is a continuously moving daily-activity window and must remain visibly distinguished from calendar-day DAU.
 
 Current-versus-previous absolute change is `current24 - previous24`. Percentage change is `(current - previous) / previous * 100`; it is `null` rather than infinity when the previous value is zero.
 

@@ -34,6 +34,22 @@ function Import-SnapMeterEnvironment {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $envPath = Resolve-SnapMeterPath -Path $Path -MustExist
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $acl = Get-Acl -LiteralPath $envPath
+        $unsafeRules = @($acl.Access | Where-Object {
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            $_.IdentityReference.Value -match '(?i)(?:^|\\)(Everyone|Users|Authenticated Users)$' -and
+            ($_.FileSystemRights -band (
+                [System.Security.AccessControl.FileSystemRights]::Read -bor
+                [System.Security.AccessControl.FileSystemRights]::ReadData -bor
+                [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+                [System.Security.AccessControl.FileSystemRights]::FullControl
+            )) -ne 0
+        })
+        if ($unsafeRules.Count -gt 0) {
+            throw "Environment file permissions are too broad: $envPath. Restrict read access to the collector account and administrators."
+        }
+    }
     $loadedNames = [System.Collections.Generic.List[string]]::new()
 
     foreach ($rawLine in [System.IO.File]::ReadAllLines($envPath)) {
@@ -73,7 +89,7 @@ function Import-SnapMeterEnvironment {
 function Get-SnapMeterEndpoint {
     param([Parameter(Mandatory = $true)][string]$Value)
 
-    $match = [regex]::Match($Value.Trim(), '^(?:\[(?<ipv6>[^\]]+)\]|(?<host>[^:/\s]+)):(?<port>[0-9]{1,5})$')
+    $match = [regex]::Match($Value.Trim(), '^(?:\[(?<ipv6>[^\]\s]+)\]|(?<host>[^:/\\@?#\s]+)):(?<port>[0-9]{1,5})$')
     if (-not $match.Success) {
         throw 'gRPC endpoint must be host:port without a URL scheme or credentials.'
     }
@@ -160,6 +176,13 @@ function Test-SnapMeterConfiguration {
         throw 'HYPERSNAP_SOURCE_MODE cannot be verified with the currently pinned upstream source; use derived or unavailable.'
     }
 
+    foreach ($name in @('SNAPMETER_INGEST_SECRET', 'SNAPCHAIN_GRPC_AUTHORIZATION', 'HYPERSNAP_GRPC_AUTHORIZATION', 'SNAPCHAIN_GRPC_API_KEY', 'HYPERSNAP_GRPC_API_KEY')) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if (-not [string]::IsNullOrEmpty($value) -and ($value.Length -gt 8192 -or $value -match '[\x00-\x1F\x7F]')) {
+            throw "$name contains unsupported control characters or is too long."
+        }
+    }
+
     if ($RequireCloud) {
         if ([string]::IsNullOrWhiteSpace($env:SNAPMETER_INGEST_URL)) {
             throw 'SNAPMETER_INGEST_URL is required for continuous cloud delivery.'
@@ -228,14 +251,14 @@ function Protect-SnapMeterText {
 
     $text = if ($null -eq $InputObject) { '' } else { [string]$InputObject }
     foreach ($entry in Get-ChildItem Env:) {
-        if ($entry.Name -match '(?i)(secret|token|password|authorization|signature|cookie)' -and
+        if ($entry.Name -match '(?i)(api[_-]?key|secret|token|password|authorization|signature|cookie)' -and
             -not [string]::IsNullOrWhiteSpace($entry.Value)) {
             $text = $text.Replace([string]$entry.Value, '[REDACTED]')
         }
     }
     $text = [regex]::Replace(
         $text,
-        '(?i)\b(authorization|secret|token|password|signature|cookie)\b\s*[:=]\s*([^\s,;]+)',
+        '(?i)\b(api[_-]?key|authorization|secret|token|password|signature|cookie)\b\s*[:=]\s*([^\s,;]+)',
         '$1=[REDACTED]'
     )
     return $text

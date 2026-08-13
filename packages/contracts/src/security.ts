@@ -45,7 +45,8 @@ export async function verifyIngestSignature(
   rawBody: string,
   suppliedSignature: string
 ): Promise<boolean> {
-  const supplied = hexToBytes(suppliedSignature.replace(/^v1=/, ""));
+  if (!/^v1=[0-9a-f]{64}$/.test(suppliedSignature)) return false;
+  const supplied = hexToBytes(suppliedSignature.slice(3));
   if (!supplied) return false;
   const expectedHex = (await signIngest(secret, timestamp, nonce, rawBody)).slice(3);
   const expected = hexToBytes(expectedHex);

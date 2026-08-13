@@ -19,7 +19,7 @@ The canonical source is plaintext `HubService` gRPC on upstream port `3383`. Sna
 - `GetEvents` for ordered per-shard durable reconciliation;
 - `GetEvent` to point-verify a durable cursor during `doctor` when that event remains inside upstream retention.
 
-There is no reflection service, so the collector ships protobufs pinned to Snapchain SHA `6152402aea2dbe732fb73076f674b038bfd4aee5`. Native gRPC is plaintext. `https` support requires an external TLS terminator. Optional authorization metadata remains useful for authenticated proxies; the inspected read RPCs themselves do not enforce upstream `rpc_auth`.
+There is no reflection service, so the collector ships protobufs pinned to Snapchain SHA `6152402aea2dbe732fb73076f674b038bfd4aee5`. Native self-hosted gRPC is plaintext; remote services need TLS termination. Optional `authorization` metadata supports authenticated proxies, and optional `x-api-key` metadata supports hosted providers such as Neynar. Configure Neynar with `snapchain-grpc-api.neynar.com:443`, TLS enabled, and `SNAPCHAIN_GRPC_API_KEY`.
 
 Event IDs encode `(block height << 14) | sequence` and are unique only within one data shard. Decimal-string IDs and per-shard cursors are mandatory. `Subscribe` has a replay-to-live race and a lagged receiver can lose live notifications, so periodic `GetEvents` reconciliation is authoritative.
 

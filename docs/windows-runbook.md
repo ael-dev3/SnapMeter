@@ -28,12 +28,16 @@ SNAPCHAIN_GRPC_URL=127.0.0.1:3383
 HYPERSNAP_GRPC_URL=127.0.0.1:4383
 SNAPCHAIN_GRPC_TLS=false
 HYPERSNAP_GRPC_TLS=false
+SNAPCHAIN_GRPC_API_KEY=
+SNAPCHAIN_RPC_MIN_INTERVAL_MS=0
 SNAPMETER_INGEST_URL=
 SNAPMETER_INGEST_SECRET=
 SNAPMETER_DATA_DIR=C:\ProgramData\SnapMeter
 ```
 
 After a verified deployment, fill the URL with the exact origin plus `/api/v1/ingest/batch` and place the matching Wrangler-managed secret only in this local file. Restrict `.env` ACLs to the collector account and administrators.
+
+For Neynar-hosted Snapchain, set `SNAPCHAIN_GRPC_URL=snapchain-grpc-api.neynar.com:443`, `SNAPCHAIN_GRPC_TLS=true`, and `SNAPCHAIN_GRPC_API_KEY` to the key from the Neynar developer portal. Set `SNAPCHAIN_RPC_MIN_INTERVAL_MS=250` to serialize GetEvents request starts across both shard workers at no more than four starts per second. If no independent Hypersnap source is available, set `HYPERSNAP_SOURCE_MODE=unavailable`. The collector never prints the API-key value.
 
 ## Interactive operation
 
@@ -77,7 +81,7 @@ Uninstalling the task does not delete databases, logs, `.env`, or outbox data.
 
 ## Data, logs, and permissions
 
-If `SNAPMETER_DATA_DIR` is empty, scripts resolve `%LOCALAPPDATA%\SnapMeter`. Production boot tasks should use an explicit absolute path, commonly `C:\ProgramData\SnapMeter`. Logs default to a `logs` child directory. The runner keeps `collector-*.log` files for 14 days by default; set `SNAPMETER_LOG_RETENTION_DAYS` from 1 through 365. Cleanup resolves and verifies every target under the configured log directory before deletion. The SQLite database, lock, health snapshot, and outbox remain local.
+If `SNAPMETER_DATA_DIR` is empty, scripts resolve `%LOCALAPPDATA%\SnapMeter`. Production boot tasks should use an explicit absolute path, commonly `C:\ProgramData\SnapMeter`. Logs default to a `logs` child directory. The runner keeps `collector-*.log` files for 14 days by default; set `SNAPMETER_LOG_RETENTION_DAYS` from 1 through 365. Cleanup resolves and verifies every target under the configured log directory before deletion. The SQLite database, lock, health snapshot, and outbox remain local. Schema v3 keeps the authoritative collector ID and actor pseudonym key inside the SQLite database; never print, extract, or export that key separately.
 
 Check free space regularly:
 
@@ -88,6 +92,14 @@ Get-ChildItem C:\ProgramData\SnapMeter -Recurse -File |
 ```
 
 Do not delete a live database or outbox to clear space. Stop the task, preserve a backup, use documented retention/maintenance, run integrity checks, and restart only after confirming the path and capacity.
+
+### Backup and failover
+
+The production D1 dataset accepts only its registered collector ID. A separately initialized collector has a different ID and pseudonym key and is rejected; do not run two independent collector databases against the same dataset.
+
+For backup or failover, stop the Scheduled Task, confirm the collector process has exited, and copy the entire resolved data directory as one SQLite-consistent unit. Preserve `snapmeter.sqlite3` together with any `snapmeter.sqlite3-wal` and `snapmeter.sqlite3-shm` files, the outbox, and their access controls. Restore that stopped state as a unit before starting the replacement host. Do not copy only a live main database, and do not move the pseudonym key into `.env` or another key store.
+
+An intentional move to a fresh database requires the guarded manual reset of `collector_binding` documented in [Cloudflare deployment](deployment.md#collector-binding). Prefer a UTC-day boundary when no older-day reconciliation is pending; otherwise clear and deliberately rebuild affected cloud actor-day membership so two key domains cannot inflate DAU. This is an operator recovery action, not automatic failover. A schema-v3 database must not be opened by a pre-v3 collector binary; restore a compatible pre-upgrade database or fix forward.
 
 ## Firewall and port binding
 
@@ -124,7 +136,7 @@ For a collector container talking to Windows-hosted nodes, use `host.docker.inte
 1. Stop the scheduled task and confirm no collector process remains.
 2. Back up `.env` and the data directory without exposing them in source control.
 3. Pull the reviewed release and run `./scripts/bootstrap.ps1 -SkipDoctor`.
-4. Run `pnpm collector doctor`, including database integrity/cursor checks.
+4. Run `./scripts/run-collector.ps1 -EnvFile .env -Mode doctor`, including database integrity/cursor checks.
 5. Reinstall the task so its resolved executable paths and arguments match the release.
 6. Start it and run `./scripts/check-health.ps1`.
 

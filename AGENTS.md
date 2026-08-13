@@ -23,6 +23,7 @@ The workspace uses Node.js 24+, pnpm 11.19, TypeScript, Vitest, Playwright, and 
 pnpm install --frozen-lockfile
 pnpm lint
 pnpm typecheck
+pnpm security:check
 pnpm test
 pnpm build
 pnpm test:e2e
@@ -31,7 +32,7 @@ pnpm collector doctor|run|status|backfill
 pnpm --filter @snapmeter/dashboard run deploy
 ```
 
-Run all five quality commands before a release. For a focused change, run the affected package test first, then the complete gates. Inspect mobile captures at 390x844 and verify no horizontal overflow, source ordering, reduced motion, offline/stale states, and real pulse behavior.
+Run all six quality commands before a release. For a focused change, run the affected package test first, then the complete gates. Inspect mobile captures at 390x844 and verify no horizontal overflow, source ordering, reduced motion, offline/stale states, and real pulse behavior.
 
 ## Non-negotiable data rules
 

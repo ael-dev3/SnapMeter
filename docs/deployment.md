@@ -47,6 +47,12 @@ pnpm --filter @snapmeter/dashboard run deploy
 
 Record the exact URL returned by Wrangler, but do not commit it yet.
 
+## Collector binding
+
+Migration `0005_collector_binding.sql` creates the single-row `collector_binding` table. The first authenticated, non-doctor ingest atomically claims `slot=1` with that batch's `collectorId`; an empty doctor probe does not claim it. Later batches with a different ID receive HTTP 409 `{ "error": "collector_identity_conflict" }` before rate limiting or persistence, even when they have a valid ingest signature. This binding prevents a newly initialized database with a different local pseudonym key from overlapping the authoritative dataset and inflating DAU.
+
+Normal failover restores the complete stopped, WAL-consistent collector SQLite state, preserving its ID, pseudonym key, cursors, and outbox. Never export or provision the pseudonym key separately. An intentional fresh-database replacement requires a D1 backup, a reviewed metric-continuity plan, and the manual statement `DELETE FROM collector_binding WHERE slot=1`. Run it only while both collectors are stopped. Prefer a UTC-day boundary when no older-day reconciliation will occur, or clear and deliberately rebuild the affected `actor_day_membership` rows before accepting the new ID. Confirm the next intended batch claims the slot, then verify health and DAU continuity before resuming. Record and review the intervention; neither ingest-secret rotation nor a code rollback resets the binding.
+
 ## Required smoke test
 
 Against the exact returned origin:

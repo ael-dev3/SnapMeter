@@ -12,6 +12,7 @@
     "collector": "pnpm --filter @snapmeter/collector collector",
     "dev": "pnpm --filter @snapmeter/dashboard dev",
     "lint": "eslint .",
+    "security:check": "node scripts/check-publication-safety.mjs && pnpm audit --prod --audit-level high",
     "test": "vitest run && pnpm --filter @snapmeter/dashboard test && pnpm --filter @snapmeter/dashboard test:worker",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "pnpm --filter @snapmeter/dashboard test:e2e",

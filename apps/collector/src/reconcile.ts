@@ -10,7 +10,16 @@ export interface ReconcileOptions {
   stopId?: string;
   pageSize?: number;
   maxPages?: number;
+  signal?: AbortSignal;
   onEvent(event: RawHubEvent): void;
+  onPageProgress?(progress: ReconcilePageProgress): void | Promise<void>;
+}
+
+export interface ReconcilePageProgress {
+  pageCount: number;
+  pageEventCount: number;
+  eventCount: number;
+  lastEventId: string;
 }
 
 export interface ReconcileResult {
@@ -35,13 +44,16 @@ export async function reconcileEvents(options: ReconcileOptions): Promise<Reconc
   const seenTokens = new Set<string>();
 
   while (pageCount < maxPages) {
-    const response = await options.rpc.getEvents(options.shard, options.startId, token, options.stopId);
+    throwIfAborted(options.signal);
+    const response = await options.rpc.getEvents(options.shard, options.startId, token, options.stopId, options.signal);
+    throwIfAborted(options.signal);
     pageCount += 1;
     const rawEvents = Array.isArray(response.events) ? response.events : [];
     if (rawEvents.length === 1 && rawEvents[0] === null) {
       return { eventCount, pageCount, lastEventId, terminal: "null-sentinel" };
     }
 
+    let pageEventCount = 0;
     for (const event of rawEvents) {
       if (!event) continue;
       const eventId = rawEventId(event);
@@ -51,8 +63,11 @@ export async function reconcileEvents(options: ReconcileOptions): Promise<Reconc
       if (options.stopId && compareEventIds(eventId, options.stopId) >= 0) continue;
       options.onEvent(event);
       eventCount += 1;
+      pageEventCount += 1;
       lastEventId = maxEventId(lastEventId, eventId);
     }
+    await options.onPageProgress?.({ pageCount, pageEventCount, eventCount, lastEventId });
+    throwIfAborted(options.signal);
 
     if (options.stopId && compareEventIds(lastEventId, options.stopId) >= 0) {
       return { eventCount, pageCount, lastEventId, terminal: "fixed-bound" };
@@ -72,6 +87,13 @@ export async function reconcileEvents(options: ReconcileOptions): Promise<Reconc
     token = response.nextPageToken;
   }
   throw new Error(`GetEvents exceeded the ${maxPages}-page reconciliation safety bound`);
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("reconciliation aborted");
+  error.name = "AbortError";
+  throw error;
 }
 
 export function isTerminalPageToken(token: Uint8Array): boolean {

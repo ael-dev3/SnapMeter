@@ -6,6 +6,8 @@ describe("ingest HMAC", () => {
     const signature = await signIngest("secret-value", "1700000000000", "batch-a", "{\"a\":1}");
     await expect(verifyIngestSignature("secret-value", "1700000000000", "batch-a", "{\"a\":1}", signature)).resolves.toBe(true);
     await expect(verifyIngestSignature("secret-value", "1700000000000", "batch-a", "{\"a\":2}", signature)).resolves.toBe(false);
+    await expect(verifyIngestSignature("secret-value", "1700000000000", "batch-a", "{\"a\":1}", signature.slice(3))).resolves.toBe(false);
+    await expect(verifyIngestSignature("secret-value", "1700000000000", "batch-a", "{\"a\":1}", signature.toUpperCase())).resolves.toBe(false);
   });
 
   it("rejects malformed or stale timestamps", () => {

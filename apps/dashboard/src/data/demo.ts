@@ -54,7 +54,9 @@ function sourceMetrics(source: Source, random: () => number): SourceMetrics {
     sourceMode: isSnapchain ? "verified" : "derived",
     status: "demo",
     quality: isSnapchain ? "high" : "derived",
-    updatedAtMs: DEMO_CLOCK_MS - (isSnapchain ? 1_200 : 2_800),
+    // Both sources share one metric-window anchor. Source-specific collector
+    // freshness remains represented independently by lastCollectorAtMs.
+    updatedAtMs: DEMO_CLOCK_MS - 2_800,
     lastActionAtMs: DEMO_CLOCK_MS - (isSnapchain ? 4_000 : 7_000),
     lastCollectorAtMs: DEMO_CLOCK_MS - (isSnapchain ? 1_200 : 2_800),
     rolling24h,

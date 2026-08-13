@@ -2,21 +2,23 @@ import { SnapchainRpcClient, type NodeInfo, type RawHubEvent, type RpcConfig } f
 
 export interface RpcSubscription {
   cancel(): void;
+  ready: Promise<void>;
   done: Promise<void>;
 }
 
 export interface CollectorRpc {
-  getInfo(): Promise<NodeInfo>;
-  getEvent(shardIndex: number, id: string): Promise<RawHubEvent>;
+  getInfo(signal?: AbortSignal): Promise<NodeInfo>;
+  getEvent(shardIndex: number, id: string, signal?: AbortSignal): Promise<RawHubEvent>;
   getEvents(
     shardIndex: number,
     startId: string,
     pageToken?: Uint8Array,
-    stopId?: string
+    stopId?: string,
+    signal?: AbortSignal
   ): Promise<{ events: Array<RawHubEvent | null>; nextPageToken?: Uint8Array }>;
   subscribe(
     shardIndex: number,
-    fromId: string,
+    fromId: string | undefined,
     onEvent: (event: RawHubEvent) => void,
     onError: (error: Error) => void
   ): RpcSubscription;
@@ -30,31 +32,32 @@ export const defaultRpcFactory: RpcFactory = (config) => new ProtocolRpcAdapter(
 class ProtocolRpcAdapter implements CollectorRpc {
   constructor(readonly client: SnapchainRpcClient) {}
 
-  getInfo(): Promise<NodeInfo> {
-    return this.client.getInfo();
+  getInfo(signal?: AbortSignal): Promise<NodeInfo> {
+    return this.client.getInfo(signal);
   }
 
-  getEvent(shardIndex: number, id: string): Promise<RawHubEvent> {
-    return this.client.getEvent(shardIndex, id);
+  getEvent(shardIndex: number, id: string, signal?: AbortSignal): Promise<RawHubEvent> {
+    return this.client.getEvent(shardIndex, id, signal);
   }
 
   async getEvents(
     shardIndex: number,
     startId: string,
     pageToken?: Uint8Array,
-    stopId?: string
+    stopId?: string,
+    signal?: AbortSignal
   ): Promise<{ events: Array<RawHubEvent | null>; nextPageToken?: Uint8Array }> {
-    return this.client.getEvents(shardIndex, startId, pageToken, stopId);
+    return this.client.getEvents(shardIndex, startId, pageToken, stopId, signal);
   }
 
   subscribe(
     shardIndex: number,
-    fromId: string,
+    fromId: string | undefined,
     onEvent: (event: RawHubEvent) => void,
     onError: (error: Error) => void
   ): RpcSubscription {
     const subscription = this.client.subscribe(shardIndex, fromId, onEvent, onError);
-    return { cancel: subscription.cancel, done: subscription.done };
+    return { cancel: subscription.cancel, ready: subscription.ready, done: subscription.done };
   }
 
   close(): void {

@@ -5,7 +5,7 @@ import { CollectorRuntime } from "./collector.js";
 import { CollectorDatabase } from "./database.js";
 import { runDoctor } from "./doctor.js";
 import { acquireProcessLock } from "./lock.js";
-import { createLogger } from "./logger.js";
+import { createLogger, redact, sensitiveEnvironmentValues } from "./logger.js";
 
 const command = process.argv[2] ?? "help";
 
@@ -16,12 +16,15 @@ async function main(): Promise<void> {
   }
   assertSupportedNode();
   const config = loadConfig();
+  const secrets = [
+    config.ingestSecret ?? "",
+    config.endpoints.snapchain.authorization ?? "",
+    config.endpoints.snapchain.apiKey ?? "",
+    config.endpoints.hypersnap.authorization ?? "",
+    config.endpoints.hypersnap.apiKey ?? ""
+  ];
   const logger = createLogger({
-    secrets: [
-      config.ingestSecret ?? "",
-      config.endpoints.snapchain.authorization ?? "",
-      config.endpoints.hypersnap.authorization ?? ""
-    ],
+    secrets,
     minimumLevel: process.env.SNAPMETER_LOG_LEVEL === "debug" ? "debug" : "info"
   });
   const database = new CollectorDatabase(config.databasePath);
@@ -44,12 +47,12 @@ async function main(): Promise<void> {
           retentionDays: config.retentionDays
         }
       };
-      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(redact(report, secrets), null, 2)}\n`);
       return;
     }
     if (command === "doctor") {
       const report = await runDoctor({ config, database });
-      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(redact(report, secrets), null, 2)}\n`);
       if (!report.ok) process.exitCode = 1;
       return;
     }
@@ -79,8 +82,15 @@ function assertSupportedNode(): void {
   }
 }
 
-function endpointSummary(endpoint: { url: string; tls: boolean; sourceMode: string; authorization?: string }): Record<string, unknown> {
-  return { url: endpoint.url, tls: endpoint.tls, sourceMode: endpoint.sourceMode, authorizationConfigured: Boolean(endpoint.authorization) };
+function endpointSummary(endpoint: { url: string; tls: boolean; sourceMode: string; authorization?: string; apiKey?: string; getEventsMinIntervalMs: number }): Record<string, unknown> {
+  return {
+    url: endpoint.url,
+    tls: endpoint.tls,
+    sourceMode: endpoint.sourceMode,
+    authorizationConfigured: Boolean(endpoint.authorization),
+    apiKeyConfigured: Boolean(endpoint.apiKey),
+    getEventsMinIntervalMs: endpoint.getEventsMinIntervalMs
+  };
 }
 
 function fileSize(path: string): number | null {
@@ -115,7 +125,10 @@ function printHelp(): void {
 }
 
 void main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${JSON.stringify({ level: "error", event: "collector.fatal", message })}\n`);
+  createLogger({
+    write: (line) => process.stderr.write(`${line}\n`),
+    secrets: sensitiveEnvironmentValues(process.env),
+    minimumLevel: "error"
+  }).error("collector.fatal", { error });
   process.exitCode = 1;
 });

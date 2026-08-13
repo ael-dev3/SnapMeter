@@ -158,13 +158,14 @@ export class CollectorRuntime {
         rpc.close();
       }
     }
-    this.#database.cleanup(this.#now(), this.#config.retentionDays);
-    const snapshots = sources().map((source) => buildMetricSnapshot(this.#database, this.#config, source, this.#now()));
+    const snapshotAtMs = this.#now();
+    this.#database.cleanup(snapshotAtMs, this.#config.retentionDays);
+    const snapshots = sources().map((source) => buildMetricSnapshot(this.#database, this.#config, source, snapshotAtMs));
     enqueueIngestBatch(this.#database, this.#config, {
       snapshots,
-      comparisonSnapshots: [buildComparisonSnapshot(this.#database, snapshots, this.#now())],
+      comparisonSnapshots: [buildComparisonSnapshot(this.#database, snapshots, snapshotAtMs)],
       health: this.#healthUpdates()
-    }, this.#now());
+    }, snapshotAtMs);
     await this.#dispatcher.drainOnce();
     this.#logger.info("backfill.completed");
   }
@@ -183,7 +184,7 @@ export class CollectorRuntime {
     try {
       while (!signal.aborted) {
         try {
-          const info = await rpc.getInfo();
+          const info = await rpc.getInfo(signal);
           this.#updateInfo(source, info);
           const shardIds = discoveredShardIds(info);
           if (shardIds.length === 0) throw new Error("node reported zero discoverable shards");
@@ -210,6 +211,7 @@ export class CollectorRuntime {
           this.#publishHealth(source);
           await abortableDelay(this.#config.discoveryIntervalMs, signal);
         } catch (error) {
+          if (signal.aborted) break;
           discoveryFailures += 1;
           const state = this.#state(source);
           state.lastError = errorMessage(error);
@@ -241,7 +243,7 @@ export class CollectorRuntime {
         const fromId = highestSeen;
         subscription = rpc.subscribe(
           shard,
-          fromId,
+          undefined,
           (event) => {
             const eventId = rawEventId(event);
             if (eventId) highestSeen = maxEventId(highestSeen, eventId);
@@ -250,6 +252,10 @@ export class CollectorRuntime {
           (error) => { streamError = error; }
         );
         this.#subscriptions.add(subscription);
+        // A live-head stream must be established before historical replay so
+        // events created during enumeration are captured and then reconciled
+        // to the fixed highest-seen bound without requesting backlog twice.
+        await subscription.ready;
         const state = this.#state(source);
         state.connectedShards.add(shard);
         state.replayingShards.add(shard);
@@ -260,15 +266,26 @@ export class CollectorRuntime {
           rpc,
           shard,
           startId: fromId,
+          signal,
           onEvent: (event) => {
             const eventId = rawEventId(event);
             if (eventId) highestSeen = maxEventId(highestSeen, eventId);
             this.#handleEvent(source, mode, shard, event, true);
+          },
+          onPageProgress: ({ lastEventId }) => {
+            // Persist replay progress only. A concurrently observed live event
+            // is not a verified gap-free bound until fixed reconciliation ends.
+            if (compareEventIds(lastEventId, fromId) > 0) {
+              this.#database.checkpointCursor(source, shard, lastEventId, this.#now());
+            }
           }
         });
         const catchupWatermark = maxEventId(initial.lastEventId, highestSeen);
         if (compareEventIds(catchupWatermark, initial.lastEventId) > 0) {
-          await this.#reconcileFixed(source, mode, shard, rpc, fromId, catchupWatermark);
+          // The initial scan already verified through initial.lastEventId.
+          // Resume inclusively there (dedupe is idempotent) and reconcile only
+          // the live tail instead of enumerating the entire backlog again.
+          await this.#reconcileFixed(source, mode, shard, rpc, initial.lastEventId, catchupWatermark, signal);
         }
         if (compareEventIds(catchupWatermark, fromId) > 0) {
           this.#database.checkpointCursor(source, shard, catchupWatermark, this.#now());
@@ -286,7 +303,7 @@ export class CollectorRuntime {
           const bound = highestSeen;
           const cursor = this.#database.getCursor(source, shard);
           if (compareEventIds(bound, cursor) > 0) {
-            await this.#reconcileFixed(source, mode, shard, rpc, cursor, bound);
+            await this.#reconcileFixed(source, mode, shard, rpc, cursor, bound, signal);
             this.#database.checkpointCursor(source, shard, bound, this.#now());
           } else {
             // Even an idle stream is checked at a fixed, already durable bound.
@@ -328,7 +345,8 @@ export class CollectorRuntime {
     shard: number,
     rpc: CollectorRpc,
     startId: string,
-    bound: string
+    bound: string,
+    signal: AbortSignal
   ): Promise<void> {
     const state = this.#state(source);
     state.reconciliationState = "checking";
@@ -338,6 +356,7 @@ export class CollectorRuntime {
       shard,
       startId,
       stopId: bound,
+      signal,
       onEvent: (event) => this.#handleEvent(source, mode, shard, event, true)
     });
     state.reconciliationState = "ok";

@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type {
   ActionFamily,
@@ -45,6 +45,7 @@ export interface OutboxRow {
   attemptCount: number;
   nextAttemptAtMs: number;
   createdAtMs: number;
+  lastError: string | null;
 }
 
 export interface DatabaseStatus {
@@ -60,18 +61,35 @@ export interface DatabaseStatus {
   lastCloudAckAtMs: number | null;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+const ACTOR_PSEUDONYM_KEY_NAME = "actor_pseudonym_key_v1";
+const ACTOR_PSEUDONYM_KEY_BYTES = 32;
+const ACTOR_PSEUDONYM_DOMAIN = "snapmeter-actor-day-v2\0";
+const MUTABLE_RUNTIME_METADATA = new Set([
+  "collector_started_at_ms",
+  "collector_stopped_at_ms",
+  "collector_heartbeat_at_ms",
+  "doctor_last_write_at_ms"
+]);
+
 export class CollectorDatabase {
   readonly #database: DatabaseSync;
+  readonly #actorPseudonymKey: Uint8Array;
 
   constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
-    this.#database.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;");
-    if (path !== ":memory:") this.#database.exec("PRAGMA journal_mode=WAL;");
-    this.#migrate();
-    if (!this.getMetadata("collector_id")) this.setMetadata("collector_id", randomUUID());
-    this.setMetadata("schema_version", String(SCHEMA_VERSION));
+    try {
+      this.#database.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;");
+      if (path !== ":memory:") this.#database.exec("PRAGMA journal_mode=WAL;");
+      this.#migrate();
+      if (!this.#getMetadata("collector_id")) this.#setMetadata("collector_id", randomUUID());
+      this.#setMetadata("schema_version", String(SCHEMA_VERSION));
+      this.#actorPseudonymKey = this.#loadActorPseudonymKey();
+    } catch (error) {
+      try { this.#database.close(); } catch { /* preserve the initialization error */ }
+      throw error;
+    }
   }
 
   close(): void {
@@ -79,9 +97,17 @@ export class CollectorDatabase {
   }
 
   get collectorId(): string {
-    const collectorId = this.getMetadata("collector_id");
+    const collectorId = this.#getMetadata("collector_id");
     if (!collectorId) throw new Error("collector id is missing");
     return collectorId;
+  }
+
+  actorDayPseudonym(source: Source, day: string, fid: string): string {
+    const message = JSON.stringify([source, day, fid]);
+    return createHmac("sha256", this.#actorPseudonymKey)
+      .update(ACTOR_PSEUDONYM_DOMAIN)
+      .update(message)
+      .digest("hex");
   }
 
   recordEvent(event: RecordedEvent): RecordEventResult {
@@ -337,7 +363,7 @@ export class CollectorDatabase {
 
   dueOutbox(nowMs: number, limit = 20): OutboxRow[] {
     return (this.#prepare(`
-      SELECT id, batch_id, payload_json, attempt_count, next_attempt_at_ms, created_at_ms
+      SELECT id, batch_id, payload_json, attempt_count, next_attempt_at_ms, created_at_ms, last_error
       FROM outbox
       WHERE next_attempt_at_ms <= ?
       ORDER BY id
@@ -348,15 +374,16 @@ export class CollectorDatabase {
       payloadJson: String(row.payload_json),
       attemptCount: Number(row.attempt_count),
       nextAttemptAtMs: Number(row.next_attempt_at_ms),
-      createdAtMs: Number(row.created_at_ms)
+      createdAtMs: Number(row.created_at_ms),
+      lastError: row.last_error === null ? null : String(row.last_error)
     }));
   }
 
   acknowledgeOutbox(id: number, batchId: string, acknowledgedAtMs: number): void {
     this.#transaction(() => {
       this.#prepare("DELETE FROM outbox WHERE id = ? AND batch_id = ?").run(id, batchId);
-      this.setMetadata("last_cloud_ack_at_ms", String(acknowledgedAtMs));
-      this.setMetadata("last_cloud_batch_id", batchId);
+      this.#setMetadata("last_cloud_ack_at_ms", String(acknowledgedAtMs));
+      this.#setMetadata("last_cloud_batch_id", batchId);
     });
   }
 
@@ -424,7 +451,7 @@ export class CollectorDatabase {
       SELECT MIN(action_at_ms) AS oldest, MAX(action_at_ms) AS newest FROM activity_actions
     `).get() as SqlRow | undefined;
     return {
-      schemaVersion: Number(this.getMetadata("schema_version") ?? 0),
+      schemaVersion: Number(this.#getMetadata("schema_version") ?? 0),
       collectorId: this.collectorId,
       actions: this.#count("activity_actions"),
       dedupeEvents: this.#count("event_dedupe"),
@@ -433,20 +460,47 @@ export class CollectorDatabase {
       pendingOutbox: this.#count("outbox"),
       oldestActionAtMs: range?.oldest === null || range?.oldest === undefined ? null : Number(range.oldest),
       newestActionAtMs: range?.newest === null || range?.newest === undefined ? null : Number(range.newest),
-      lastCloudAckAtMs: nullableInteger(this.getMetadata("last_cloud_ack_at_ms"))
+      lastCloudAckAtMs: nullableInteger(this.#getMetadata("last_cloud_ack_at_ms"))
     };
   }
 
-  getMetadata(key: string): string | null {
+  setMetadata(key: string, value: string): void {
+    if (!MUTABLE_RUNTIME_METADATA.has(key)) throw new Error(`unsupported runtime metadata key: ${key}`);
+    this.#setMetadata(key, value);
+  }
+
+  #getMetadata(key: string): string | null {
     const row = this.#prepare("SELECT value FROM collector_metadata WHERE key = ?").get(key) as { value?: unknown } | undefined;
     return row?.value === undefined ? null : String(row.value);
   }
 
-  setMetadata(key: string, value: string): void {
+  #setMetadata(key: string, value: string): void {
     this.#prepare(`
       INSERT INTO collector_metadata(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(key, value);
+  }
+
+  #loadActorPseudonymKey(): Uint8Array {
+    let rows: Array<{ name?: unknown; value?: unknown }>;
+    try {
+      rows = this.#prepare("SELECT name, value FROM collector_secrets").all() as Array<{
+        name?: unknown;
+        value?: unknown;
+      }>;
+    } catch {
+      throw new Error("actor pseudonym key is missing or invalid");
+    }
+    const row = rows[0];
+    if (
+      rows.length !== 1 ||
+      row?.name !== ACTOR_PSEUDONYM_KEY_NAME ||
+      !(row.value instanceof Uint8Array) ||
+      row.value.byteLength !== ACTOR_PSEUDONYM_KEY_BYTES
+    ) {
+      throw new Error("actor pseudonym key is missing or invalid");
+    }
+    return new Uint8Array(row.value);
   }
 
   #count(table: "activity_actions" | "event_dedupe" | "actor_days" | "minute_buckets" | "outbox"): number {
@@ -488,6 +542,15 @@ export class CollectorDatabase {
       this.#transaction(() => {
         this.#database.exec(MIGRATION_2);
         this.#prepare("INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, ?)").run(Date.now());
+      });
+    }
+    if (current < 3) {
+      this.#transaction(() => {
+        this.#database.exec(MIGRATION_3);
+        this.#prepare("INSERT INTO collector_secrets(name, value) VALUES (?, ?)")
+          .run(ACTOR_PSEUDONYM_KEY_NAME, randomBytes(ACTOR_PSEUDONYM_KEY_BYTES));
+        this.#loadActorPseudonymKey();
+        this.#prepare("INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, ?)").run(Date.now());
       });
     }
   }
@@ -653,5 +716,12 @@ const MIGRATION_2 = `
     start_at_ms INTEGER NOT NULL CHECK (start_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL,
     PRIMARY KEY (source, shard)
+  ) STRICT;
+`;
+
+const MIGRATION_3 = `
+  CREATE TABLE collector_secrets (
+    name TEXT PRIMARY KEY CHECK (name IN ('actor_pseudonym_key_v1')),
+    value BLOB NOT NULL CHECK (typeof(value) = 'blob' AND length(value) = 32)
   ) STRICT;
 `;

@@ -17,7 +17,10 @@ export default defineConfig(async () => {
     ],
     test: {
       include: ["worker/**/*.worker.test.ts"],
-      setupFiles: ["./worker/test-setup.ts"]
+      setupFiles: ["./worker/test-setup.ts"],
+      // Durable Object + D1 integration can exceed Vitest's 5s unit-test
+      // default on a busy development host without indicating a product SLA.
+      testTimeout: 15_000
     }
   };
 });

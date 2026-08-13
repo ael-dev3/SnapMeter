@@ -6,7 +6,7 @@
 
 [Open SnapMeter](https://snapmeter.ael-dev3.workers.dev)
 
-The public origin, API, authenticated ingest, D1 persistence, WebSocket hydration, real pulse fan-out, and duplicate suppression were smoke-tested after deployment. The collector is not connected to upstream nodes yet, so production honestly reports both sources as disconnected; use `?demo=1` only for the clearly labelled seeded preview.
+The public origin, API, authenticated ingest, D1 persistence, WebSocket hydration, real pulse fan-out, and duplicate suppression were smoke-tested after deployment. Source availability changes independently of the website, so the dashboard always renders the latest authenticated health state instead of promising that either upstream node is live. Use `?demo=1` only for the clearly labelled seeded preview.
 
 ## Source quality
 
@@ -36,24 +36,29 @@ Action time comes from confirmed shard-chunk time when available. Collector rece
 
 ## Quick start
 
-Requirements: Node.js 24 or later, pnpm 11.19, and reachable private Snapchain-compatible gRPC endpoints.
+A clean checkout can reproduce the dashboard, deterministic demo, tests, and production bundle without credentials, a database dump, or a node snapshot. Requirements are Git, Node.js 24 or later, and pnpm 11.19.0.
 
 ```powershell
 git clone https://github.com/ael-dev3/SnapMeter.git
 Set-Location SnapMeter
-Copy-Item .env.example .env
-./scripts/bootstrap.ps1
-pnpm collector doctor
-pnpm collector run
-```
-
-In a second terminal, start the local dashboard:
-
-```powershell
+pnpm install --frozen-lockfile
 pnpm dev
 ```
 
+Open the URL printed by Vite with `?demo=1`, normally `http://127.0.0.1:5173/?demo=1`. Demo mode is deterministic, synthetic, clearly labelled, and does not contact a collector or require private data.
+
+To connect the collector, copy the environment template only after the demo works, keep the resulting file untracked, and configure one or two private Snapchain-compatible gRPC endpoints:
+
+```powershell
+Copy-Item .env.example .env
+./scripts/bootstrap.ps1
+./scripts/run-collector.ps1 -EnvFile .env -Mode doctor
+./scripts/run-collector.ps1 -EnvFile .env -Mode run
+```
+
 The convenience endpoint defaults are `127.0.0.1:3383` for Snapchain and `127.0.0.1:4383` for Hypersnap. Upstream Hypersnap also listens on internal port `3383`; `4383` is only the documented host remap when both nodes share one machine.
+
+The complete clean-room procedure, including local D1 migration, optional upstream-node checkouts, storage layout, validation, and the boundary around intentionally excluded private data, is in [Local reconstruction](docs/local-reconstruction.md).
 
 ## Architecture
 
@@ -79,6 +84,8 @@ SNAPCHAIN_GRPC_URL=127.0.0.1:3383
 HYPERSNAP_GRPC_URL=127.0.0.1:4383
 SNAPCHAIN_GRPC_TLS=false
 HYPERSNAP_GRPC_TLS=false
+SNAPCHAIN_GRPC_API_KEY=
+SNAPCHAIN_RPC_MIN_INTERVAL_MS=0
 SNAPMETER_INGEST_URL=
 SNAPMETER_INGEST_SECRET=
 SNAPMETER_DATA_DIR=C:\ProgramData\SnapMeter
@@ -86,11 +93,13 @@ SNAPMETER_DATA_DIR=C:\ProgramData\SnapMeter
 
 After deployment, set `SNAPMETER_INGEST_URL` to the smoke-tested origin plus `/api/v1/ingest/batch` and set the secret locally to the value stored with Wrangler. Never commit either value.
 
+For a hosted Neynar Snapchain source, use `SNAPCHAIN_GRPC_URL=snapchain-grpc-api.neynar.com:443`, enable `SNAPCHAIN_GRPC_TLS=true`, place the Neynar credential in `SNAPCHAIN_GRPC_API_KEY`, and set `SNAPCHAIN_RPC_MIN_INTERVAL_MS=250` to pace shared two-shard replay below the Starter-plan request ceiling. Set `HYPERSNAP_SOURCE_MODE=unavailable` when no separate Hypersnap endpoint is connected. Keep the API key only in the ignored local environment file.
+
 ```powershell
-pnpm collector doctor    # endpoints, shards, storage, clock, ingest auth, cursors, disk
-pnpm collector run       # continuous collection
-pnpm collector status    # last local health snapshot
-pnpm collector backfill  # bounded reconciliation; never creates live pulses
+./scripts/run-collector.ps1 -EnvFile .env -Mode doctor    # endpoints, shards, storage, clock, ingest auth, cursors, disk
+./scripts/run-collector.ps1 -EnvFile .env -Mode run       # continuous collection
+./scripts/run-collector.ps1 -EnvFile .env -Mode status    # last local health snapshot
+./scripts/run-collector.ps1 -EnvFile .env -Mode backfill  # bounded reconciliation; never creates live pulses
 ```
 
 Snapchain's default HubEvent retention is only three days. An exact 30-day cold start requires a node configured with at least 31 days of event retention or a trusted prior history. Otherwise SnapMeter exposes partial history until enough prospective data accumulates.
@@ -136,6 +145,7 @@ Do not publish a URL until all release smoke tests pass. Full creation, migratio
 ```powershell
 pnpm lint
 pnpm typecheck
+pnpm security:check
 pnpm test
 pnpm build
 pnpm test:e2e
@@ -143,13 +153,20 @@ pnpm test:e2e
 
 Pull requests run the quality gates. Default-branch deployment is conditional on the required Cloudflare repository secrets. Operational and security checks are documented in [Troubleshooting](docs/troubleshooting.md) and [Security](docs/security.md).
 
+## License
+
+SnapMeter-authored source, documentation, and assets are released under the [MIT License](LICENSE), copyright 2026 ael-dev3. Vendored Snapchain protocol definitions retain their upstream `GPL-3.0` license; see [Third-party notices](THIRD_PARTY_NOTICES.md) and the included license text. Dependency packages retain their own licenses. No license grants rights to third-party names or trademarks.
+
 ## Documentation
 
+- [Local reconstruction without private data](docs/local-reconstruction.md)
 - [Architecture](docs/architecture.md)
 - [Metric definitions and integrity policy](docs/metrics.md)
 - [Data sources and source modes](docs/data-sources.md)
 - [Pinned upstream sources](docs/upstream-sources.md)
 - [Windows runbook](docs/windows-runbook.md)
 - [Cloudflare deployment](docs/deployment.md)
+- [Farcaster Mini App release](docs/farcaster-miniapp.md)
 - [Security model](docs/security.md)
+- [Private vulnerability reporting](SECURITY.md)
 - [Troubleshooting](docs/troubleshooting.md)

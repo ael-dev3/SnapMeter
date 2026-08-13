@@ -1,5 +1,6 @@
 import { Analytics } from "./components/Analytics";
 import { ProtocolPanel } from "./components/ProtocolPanel";
+import { MiniAppProvider } from "./farcaster";
 import { useLiveMetrics } from "./hooks/useLiveMetrics";
 
 function TransportNotice({
@@ -26,7 +27,7 @@ function TransportNotice({
   );
 }
 
-export default function App(): React.JSX.Element {
+function Dashboard(): React.JSX.Element {
   const { summary, transport, pulses, error, now, retry, demo } = useLiveMetrics();
   return (
     <>
@@ -67,5 +68,13 @@ export default function App(): React.JSX.Element {
       )}
       <TransportNotice transport={transport} error={error} retry={retry} />
     </>
+  );
+}
+
+export default function App(): React.JSX.Element {
+  return (
+    <MiniAppProvider>
+      <Dashboard />
+    </MiniAppProvider>
   );
 }
