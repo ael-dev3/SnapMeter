@@ -1,0 +1,14 @@
+# Illustrative fragment for Docker Compose 2.24.4 or later. Merge these service
+# entries into a reviewed upstream-node project that already defines
+# `snapchain` and `hypersnap`; this file cannot start heavyweight nodes itself.
+# `!override` is important: it removes inherited port publications instead of
+# appending a second mapping that leaves a collision or public RPC exposure.
+# Add distinct gossip/HTTP publications separately only when the reviewed node
+# topology requires them. Both containers listen on internal gRPC port 3383.
+services:
+  snapchain:
+    ports: !override
+      - "127.0.0.1:3383:3383/tcp"
+  hypersnap:
+    ports: !override
+      - "127.0.0.1:4383:3383/tcp"

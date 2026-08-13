@@ -1,0 +1,47 @@
+name: snapmeter
+
+services:
+  collector:
+    image: node:24-bookworm-slim
+    profiles: [collector]
+    init: true
+    restart: unless-stopped
+    working_dir: /workspace
+    command:
+      - sh
+      - -eu
+      - -c
+      - corepack enable && pnpm install --frozen-lockfile && pnpm collector run
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      SNAPMETER_DATA_DIR: /var/lib/snapmeter
+      SNAPCHAIN_GRPC_URL: ${SNAPCHAIN_GRPC_URL_DOCKER:-host.docker.internal:3383}
+      HYPERSNAP_GRPC_URL: ${HYPERSNAP_GRPC_URL_DOCKER:-host.docker.internal:4383}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - .:/workspace
+      - collector-data:/var/lib/snapmeter
+      - pnpm-store:/root/.local/share/pnpm/store
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: [CMD-SHELL, "pnpm collector status >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  collector-data:
+  pnpm-store:
