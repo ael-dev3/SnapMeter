@@ -2,6 +2,7 @@ import type { ActionFamily } from "@snapmeter/contracts";
 
 export const SNAPCHAIN_UPSTREAM_SHA = "6152402aea2dbe732fb73076f674b038bfd4aee5";
 export const HYPERSNAP_UPSTREAM_SHA = "2eee4c9f2a7833ce7971dfef028480abbe9c4720";
+export const HYPERSNAP_PUBLIC_COMPAT_SHA = "ce408646fd09d886f275b74757341a1d328728ab";
 export const HYPERSNAP_CLASSIFIER_VERSION = `${HYPERSNAP_UPSTREAM_SHA.slice(0, 12)}.1`;
 
 export const MESSAGE_TYPES = {

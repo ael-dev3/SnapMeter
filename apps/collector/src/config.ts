@@ -2,14 +2,28 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Source, SourceMode } from "@snapmeter/contracts";
 
-export interface RpcEndpointConfig {
+export type RpcTransport = "grpc" | "https-json";
+
+export interface RpcTransportConfig {
   url: string;
+  transport: RpcTransport;
   tls: boolean;
   authorization?: string;
   apiKey?: string;
-  sourceMode: SourceMode;
   timeoutMs: number;
   getEventsMinIntervalMs: number;
+  pollIntervalMs?: number;
+  expectedPeerId?: string;
+  expectedVersion?: string;
+}
+
+export interface RpcEndpointConfig extends RpcTransportConfig {
+  sourceMode: SourceMode;
+  fallback?: RpcTransportConfig;
+  failoverAfterFailures: number;
+  preferredRecoveryIntervalMs: number;
+  preferredRecoverySuccesses: number;
+  maximumBlockDelaySeconds: number;
 }
 
 export interface CollectorConfig {
@@ -83,6 +97,13 @@ function endpoint(
   defaultMode: SourceMode,
   timeoutMs: number
 ): RpcEndpointConfig {
+  const endpointTimeoutMs = integer(
+    env[`${prefix}_RPC_TIMEOUT_MS`],
+    prefix === "HYPERSNAP" ? Math.min(timeoutMs, 5_000) : timeoutMs,
+    250,
+    120_000,
+    `${prefix}_RPC_TIMEOUT_MS`
+  );
   const url = clean(env[`${prefix}_GRPC_URL`]) ?? defaultUrl;
   const endpointMatch = /^(?:\[([^\]\s]+)\]|([^:\s]+)):(\d{1,5})$/.exec(url);
   const host = endpointMatch?.[1] ?? endpointMatch?.[2] ?? "";
@@ -107,24 +128,119 @@ function endpoint(
   const tls = booleanValue(env[`${prefix}_GRPC_TLS`], false, `${prefix}_GRPC_TLS`);
   const authorization = optionalCredential(env[`${prefix}_GRPC_AUTHORIZATION`], `${prefix}_GRPC_AUTHORIZATION`);
   const apiKey = optionalCredential(env[`${prefix}_GRPC_API_KEY`], `${prefix}_GRPC_API_KEY`);
+  const expectedPeerId = peerId(env[`${prefix}_EXPECTED_PEER_ID`], `${prefix}_EXPECTED_PEER_ID`);
+  const expectedVersion = optionalVersion(env[`${prefix}_EXPECTED_VERSION`], `${prefix}_EXPECTED_VERSION`);
   if (!tls && !isLoopbackHost(host) && (authorization !== undefined || apiKey !== undefined)) {
     throw new Error(`${prefix}_GRPC_TLS must be true when credentials are configured for a non-loopback endpoint`);
   }
-  return {
+  if (!tls && !isPrivateOrLoopbackHost(host)) {
+    throw new Error(`${prefix}_GRPC_TLS must be true for an endpoint outside a private or loopback network`);
+  }
+  const result: RpcEndpointConfig = {
     url,
+    transport: "grpc",
     tls,
     authorization,
     apiKey,
+    expectedPeerId,
+    expectedVersion,
     sourceMode,
-    timeoutMs,
+    timeoutMs: endpointTimeoutMs,
     getEventsMinIntervalMs: integer(
       env[`${prefix}_RPC_MIN_INTERVAL_MS`],
       0,
       0,
       3_600_000,
       `${prefix}_RPC_MIN_INTERVAL_MS`
-    )
+    ),
+    failoverAfterFailures: integer(
+      env[`${prefix}_FAILOVER_AFTER_FAILURES`],
+      3,
+      1,
+      100,
+      `${prefix}_FAILOVER_AFTER_FAILURES`
+    ),
+    preferredRecoveryIntervalMs: integer(
+      env[`${prefix}_PREFERRED_RECOVERY_INTERVAL_MS`],
+      60_000,
+      5_000,
+      3_600_000,
+      `${prefix}_PREFERRED_RECOVERY_INTERVAL_MS`
+    ),
+    preferredRecoverySuccesses: integer(
+      env[`${prefix}_PREFERRED_RECOVERY_SUCCESSES`],
+      3,
+      1,
+      100,
+      `${prefix}_PREFERRED_RECOVERY_SUCCESSES`
+    ),
+    maximumBlockDelaySeconds: prefix === "HYPERSNAP"
+      ? integer(
+          env.HYPERSNAP_MAX_BLOCK_DELAY_SECONDS,
+          30,
+          0,
+          86_400,
+          "HYPERSNAP_MAX_BLOCK_DELAY_SECONDS"
+        )
+      : 30
   };
+  if (prefix === "HYPERSNAP") result.fallback = hypersnapHttpFallback(env, endpointTimeoutMs);
+  return result;
+}
+
+function hypersnapHttpFallback(env: EnvironmentLike, timeoutMs: number): RpcTransportConfig | undefined {
+  const url = optionalHttpUrl(env.HYPERSNAP_FALLBACK_HTTP_URL, "HYPERSNAP_FALLBACK_HTTP_URL");
+  if (url === undefined) {
+    if (clean(env.HYPERSNAP_FALLBACK_EXPECTED_PEER_ID) !== undefined || clean(env.HYPERSNAP_FALLBACK_EXPECTED_VERSION) !== undefined) {
+      throw new Error("Hypersnap fallback identity pins require HYPERSNAP_FALLBACK_HTTP_URL");
+    }
+    return undefined;
+  }
+  if (!url.startsWith("https://")) throw new Error("HYPERSNAP_FALLBACK_HTTP_URL must use HTTPS");
+  const expectedPeerId = peerId(env.HYPERSNAP_FALLBACK_EXPECTED_PEER_ID, "HYPERSNAP_FALLBACK_EXPECTED_PEER_ID");
+  if (!expectedPeerId) throw new Error("HYPERSNAP_FALLBACK_EXPECTED_PEER_ID is required for a public HTTP fallback");
+  const expectedVersion = optionalVersion(env.HYPERSNAP_FALLBACK_EXPECTED_VERSION, "HYPERSNAP_FALLBACK_EXPECTED_VERSION");
+  if (!expectedVersion) throw new Error("HYPERSNAP_FALLBACK_EXPECTED_VERSION is required for a public HTTP fallback");
+  return {
+    url,
+    transport: "https-json",
+    tls: true,
+    timeoutMs,
+    getEventsMinIntervalMs: integer(
+      env.HYPERSNAP_FALLBACK_RPC_MIN_INTERVAL_MS,
+      1_000,
+      0,
+      3_600_000,
+      "HYPERSNAP_FALLBACK_RPC_MIN_INTERVAL_MS"
+    ),
+    pollIntervalMs: integer(
+      env.HYPERSNAP_FALLBACK_POLL_INTERVAL_MS,
+      5_000,
+      250,
+      60_000,
+      "HYPERSNAP_FALLBACK_POLL_INTERVAL_MS"
+    ),
+    expectedPeerId,
+    expectedVersion
+  };
+}
+
+function peerId(value: string | undefined, name: string): string | undefined {
+  const normalized = clean(value);
+  if (normalized === undefined) return undefined;
+  if (normalized.length > 128 || !/^[1-9A-HJ-NP-Za-km-z]+$/.test(normalized)) {
+    throw new Error(`${name} must be a base58 peer identifier`);
+  }
+  return normalized;
+}
+
+function optionalVersion(value: string | undefined, name: string): string | undefined {
+  const normalized = clean(value);
+  if (normalized === undefined) return undefined;
+  if (normalized.length > 64 || !/^[0-9A-Za-z][0-9A-Za-z._/+:-]*$/.test(normalized)) {
+    throw new Error(`${name} contains an invalid version identifier`);
+  }
+  return normalized;
 }
 
 function sourceModeValue(value: string | undefined, fallback: SourceMode, name: string): SourceMode {
@@ -166,6 +282,17 @@ function isLoopbackHost(value: string): boolean {
   const ipv4 = /^(\d{1,3})(?:\.(\d{1,3})){3}$/.exec(host);
   if (!ipv4 || Number(ipv4[1]) !== 127) return false;
   return host.split(".").every((part) => Number(part) <= 255);
+}
+
+function isPrivateOrLoopbackHost(value: string): boolean {
+  if (isLoopbackHost(value)) return true;
+  const host = value.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "host.docker.internal") return true;
+  const parts = host.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parts[0] === 10
+    || (parts[0] === 172 && (parts[1] as number) >= 16 && (parts[1] as number) <= 31)
+    || (parts[0] === 192 && parts[1] === 168);
 }
 
 function hasControlCharacters(value: string): boolean {

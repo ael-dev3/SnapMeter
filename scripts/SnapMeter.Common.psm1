@@ -136,6 +136,56 @@ function Test-SnapMeterIntegerValue {
     }
 }
 
+function Get-SnapMeterHttpsUri {
+    param([Parameter(Mandatory = $true)][string]$Value, [string]$Name = 'HTTPS URL')
+
+    [Uri]$uri = $null
+    if (-not [Uri]::TryCreate($Value.Trim(), [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne 'https' -or
+        [string]::IsNullOrWhiteSpace($uri.Host) -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment)) {
+        throw "$Name must be an absolute HTTPS URL without credentials, a query, or a fragment."
+    }
+    return $uri
+}
+
+function Test-SnapMeterPeerIdValue {
+    param([AllowEmptyString()][string]$Value, [Parameter(Mandatory = $true)][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return
+    }
+    $normalized = $Value.Trim()
+    if ($normalized.Length -gt 128 -or $normalized -notmatch '^[1-9A-HJ-NP-Za-km-z]+$') {
+        throw "$Name must be a base58 peer identifier no longer than 128 characters."
+    }
+}
+
+function Test-SnapMeterVersionValue {
+    param([AllowEmptyString()][string]$Value, [Parameter(Mandatory = $true)][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return
+    }
+    $normalized = $Value.Trim()
+    if ($normalized.Length -gt 64 -or $normalized -notmatch '^[0-9A-Za-z][0-9A-Za-z._/+:-]*$') {
+        throw "$Name contains an invalid version identifier."
+    }
+}
+
+function Get-SnapMeterHypersnapInfoUri {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $baseUri = Get-SnapMeterHttpsUri -Value $Value -Name 'HYPERSNAP_FALLBACK_HTTP_URL'
+    $builder = [UriBuilder]::new($baseUri)
+    if (-not $builder.Path.EndsWith('/')) {
+        $builder.Path += '/'
+    }
+    return [Uri]::new($builder.Uri, 'v1/info')
+}
+
 function Test-SnapMeterConfiguration {
     param([switch]$RequireCloud)
 
@@ -151,6 +201,16 @@ function Test-SnapMeterConfiguration {
     Test-SnapMeterBooleanValue -Value $env:HYPERSNAP_GRPC_TLS -Name 'HYPERSNAP_GRPC_TLS'
     foreach ($rule in @(
         @{ Name = 'SNAPMETER_RPC_TIMEOUT_MS'; Minimum = 250L; Maximum = 120000L },
+        @{ Name = 'SNAPCHAIN_RPC_TIMEOUT_MS'; Minimum = 250L; Maximum = 120000L },
+        @{ Name = 'HYPERSNAP_RPC_TIMEOUT_MS'; Minimum = 250L; Maximum = 120000L },
+        @{ Name = 'SNAPCHAIN_RPC_MIN_INTERVAL_MS'; Minimum = 0L; Maximum = 3600000L },
+        @{ Name = 'HYPERSNAP_RPC_MIN_INTERVAL_MS'; Minimum = 0L; Maximum = 3600000L },
+        @{ Name = 'HYPERSNAP_FALLBACK_RPC_MIN_INTERVAL_MS'; Minimum = 0L; Maximum = 3600000L },
+        @{ Name = 'HYPERSNAP_FALLBACK_POLL_INTERVAL_MS'; Minimum = 250L; Maximum = 60000L },
+        @{ Name = 'HYPERSNAP_FAILOVER_AFTER_FAILURES'; Minimum = 1L; Maximum = 100L },
+        @{ Name = 'HYPERSNAP_PREFERRED_RECOVERY_INTERVAL_MS'; Minimum = 5000L; Maximum = 3600000L },
+        @{ Name = 'HYPERSNAP_PREFERRED_RECOVERY_SUCCESSES'; Minimum = 1L; Maximum = 100L },
+        @{ Name = 'HYPERSNAP_MAX_BLOCK_DELAY_SECONDS'; Minimum = 0L; Maximum = 86400L },
         @{ Name = 'SNAPMETER_RECONCILE_INTERVAL_MS'; Minimum = 1000L; Maximum = 3600000L },
         @{ Name = 'SNAPMETER_DISCOVERY_INTERVAL_MS'; Minimum = 5000L; Maximum = 3600000L },
         @{ Name = 'SNAPMETER_SNAPSHOT_INTERVAL_MS'; Minimum = 1000L; Maximum = 300000L },
@@ -166,6 +226,26 @@ function Test-SnapMeterConfiguration {
         $configuredValue = [Environment]::GetEnvironmentVariable($rule.Name, 'Process')
         Test-SnapMeterIntegerValue -Value $configuredValue -Name $rule.Name -Minimum $rule.Minimum -Maximum $rule.Maximum
     }
+
+    Test-SnapMeterPeerIdValue -Value $env:SNAPCHAIN_EXPECTED_PEER_ID -Name 'SNAPCHAIN_EXPECTED_PEER_ID'
+    Test-SnapMeterPeerIdValue -Value $env:HYPERSNAP_EXPECTED_PEER_ID -Name 'HYPERSNAP_EXPECTED_PEER_ID'
+    Test-SnapMeterVersionValue -Value $env:SNAPCHAIN_EXPECTED_VERSION -Name 'SNAPCHAIN_EXPECTED_VERSION'
+    Test-SnapMeterVersionValue -Value $env:HYPERSNAP_EXPECTED_VERSION -Name 'HYPERSNAP_EXPECTED_VERSION'
+
+    $fallbackUrlConfigured = -not [string]::IsNullOrWhiteSpace($env:HYPERSNAP_FALLBACK_HTTP_URL)
+    $fallbackPeerConfigured = -not [string]::IsNullOrWhiteSpace($env:HYPERSNAP_FALLBACK_EXPECTED_PEER_ID)
+    $fallbackVersionConfigured = -not [string]::IsNullOrWhiteSpace($env:HYPERSNAP_FALLBACK_EXPECTED_VERSION)
+    if (-not $fallbackUrlConfigured -and ($fallbackPeerConfigured -or $fallbackVersionConfigured)) {
+        throw 'Hypersnap fallback identity pins require HYPERSNAP_FALLBACK_HTTP_URL.'
+    }
+    if ($fallbackUrlConfigured) {
+        [void](Get-SnapMeterHttpsUri -Value $env:HYPERSNAP_FALLBACK_HTTP_URL -Name 'HYPERSNAP_FALLBACK_HTTP_URL')
+        if (-not $fallbackPeerConfigured -or -not $fallbackVersionConfigured) {
+            throw 'A Hypersnap HTTPS fallback requires both HYPERSNAP_FALLBACK_EXPECTED_PEER_ID and HYPERSNAP_FALLBACK_EXPECTED_VERSION.'
+        }
+    }
+    Test-SnapMeterPeerIdValue -Value $env:HYPERSNAP_FALLBACK_EXPECTED_PEER_ID -Name 'HYPERSNAP_FALLBACK_EXPECTED_PEER_ID'
+    Test-SnapMeterVersionValue -Value $env:HYPERSNAP_FALLBACK_EXPECTED_VERSION -Name 'HYPERSNAP_FALLBACK_EXPECTED_VERSION'
 
     $snapchainMode = if ([string]::IsNullOrWhiteSpace($env:SNAPCHAIN_SOURCE_MODE)) { 'verified' } else { $env:SNAPCHAIN_SOURCE_MODE.ToLowerInvariant() }
     $hypersnapMode = if ([string]::IsNullOrWhiteSpace($env:HYPERSNAP_SOURCE_MODE)) { 'derived' } else { $env:HYPERSNAP_SOURCE_MODE.ToLowerInvariant() }
@@ -278,6 +358,7 @@ Export-ModuleMember -Function @(
     'Resolve-SnapMeterPath',
     'Import-SnapMeterEnvironment',
     'Get-SnapMeterEndpoint',
+    'Get-SnapMeterHypersnapInfoUri',
     'Test-SnapMeterBooleanValue',
     'Test-SnapMeterIntegerValue',
     'Test-SnapMeterConfiguration',

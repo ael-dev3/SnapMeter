@@ -1,8 +1,8 @@
 import type { NodeInfo, RawHubEvent } from "@snapmeter/protocol";
-import { FARCASTER_EPOCH_MS } from "@snapmeter/protocol";
+import { FARCASTER_EPOCH_MS, rawHubEventFingerprint } from "@snapmeter/protocol";
 import { shouldEmitPulse } from "@snapmeter/metrics";
 import type { Source, SourceMode, SourceStatus } from "@snapmeter/contracts";
-import type { CollectorConfig } from "./config.js";
+import type { CollectorConfig, RpcEndpointConfig, RpcTransportConfig } from "./config.js";
 import { defaultActivityAdapterFactory, type ActivityAdapterFactory, type SourceActivityAdapter } from "./adapter.js";
 import { CollectorDatabase, compareEventIds, maxEventId, type SourceHealthRecord } from "./database.js";
 import {
@@ -35,11 +35,21 @@ interface SourceRuntimeState {
   synchronized: boolean;
   lastContactAtMs: number | null;
   lastError: string | null;
+  activeEndpointRole: EndpointRole | null;
 }
 
 interface ShardWorker {
   controller: AbortController;
   promise: Promise<void>;
+}
+
+type EndpointRole = "primary" | "fallback";
+
+interface OpenEndpoint {
+  role: EndpointRole;
+  transport: RpcTransportConfig;
+  rpc: CollectorRpc;
+  info: NodeInfo;
 }
 
 export interface CollectorRuntimeOptions {
@@ -131,9 +141,12 @@ export class CollectorRuntime {
     for (const source of sources()) {
       const endpoint = this.#config.endpoints[source];
       if (endpoint.sourceMode === "unavailable") continue;
-      const rpc = this.#rpcFactory(endpoint);
+      const opened = await this.#openFirstAvailable(source, endpoint);
+      const rpc = opened.rpc;
       try {
-        const info = await rpc.getInfo();
+        this.#state(source).activeEndpointRole = opened.role;
+        this.#database.setActiveSourceEndpoint(source, opened.role, this.#now());
+        const info = opened.info;
         const shardIds = discoveredShardIds(info);
         if (shardIds.length === 0) throw new Error("node reported no shards");
         for (const shard of shardIds) {
@@ -156,6 +169,7 @@ export class CollectorRuntime {
         this.#publishHealth(source);
       } finally {
         rpc.close();
+        this.#clients.delete(rpc);
       }
     }
     const snapshotAtMs = this.#now();
@@ -177,16 +191,96 @@ export class CollectorRuntime {
       await untilAborted(signal);
       return;
     }
-    const rpc = this.#rpcFactory(endpoint);
-    this.#clients.add(rpc);
+    let role: EndpointRole = "primary";
+    let failures = 0;
+    while (!signal.aborted) {
+      const transport = endpointForRole(endpoint, role);
+      if (!transport) {
+        role = "primary";
+        await abortableDelay(exponentialBackoffMs(failures++, { random: this.#random }), signal);
+        continue;
+      }
+      let opened: OpenEndpoint;
+      try {
+        opened = await this.#openEndpoint(source, role, transport, signal);
+      } catch (error) {
+        if (signal.aborted) break;
+        this.#markEndpointUnavailable(source);
+        this.#logger.warn("source.endpoint_rejected", { source, role, error });
+        role = alternateRole(role, endpoint);
+        if (role === "primary") {
+          await abortableDelay(exponentialBackoffMs(failures++, { random: this.#random }), signal);
+        }
+        continue;
+      }
+      try {
+        this.#logger.info("source.endpoint_activated", { source, role, transport: transport.transport });
+        this.#state(source).activeEndpointRole = role;
+        this.#database.setActiveSourceEndpoint(source, role, this.#now());
+        failures = 0;
+        await this.#runSourceSession(source, endpoint, opened, signal);
+        return;
+      } catch (error) {
+        if (signal.aborted) break;
+        const preferredRecovered = error instanceof PreferredEndpointReady;
+        this.#logger.warn("source.endpoint_switching", {
+          source,
+          fromRole: role,
+          toRole: preferredRecovered ? "primary" : alternateRole(role, endpoint),
+          reason: preferredRecovered ? "preferred_recovered" : "active_endpoint_unavailable"
+        });
+        role = preferredRecovered ? "primary" : alternateRole(role, endpoint);
+      } finally {
+        opened.rpc.close();
+        this.#clients.delete(opened.rpc);
+        this.#resetSessionState(source);
+      }
+    }
+  }
+
+  async #runSourceSession(
+    source: Source,
+    endpoint: RpcEndpointConfig,
+    opened: OpenEndpoint,
+    signal: AbortSignal
+  ): Promise<void> {
+    const rpc = opened.rpc;
     const workers = new Map<number, ShardWorker>();
+    const shardFailureCounts = new Map<number, number>();
+    let resolveDataPlaneFailure: ((error: ActiveEndpointUnavailable) => void) | undefined;
+    const dataPlaneFailure = new Promise<ActiveEndpointUnavailable>((resolve) => {
+      resolveDataPlaneFailure = resolve;
+    });
+    let dataPlaneFailed = false;
+    const onShardFailure = (shard: number): void => {
+      const failures = (shardFailureCounts.get(shard) ?? 0) + 1;
+      shardFailureCounts.set(shard, failures);
+      if (!dataPlaneFailed && failures >= endpoint.failoverAfterFailures) {
+        dataPlaneFailed = true;
+        resolveDataPlaneFailure?.(new ActiveEndpointUnavailable("active endpoint failed repeated shard data-plane operations"));
+      }
+    };
+    const onShardHealthy = (shard: number): void => {
+      shardFailureCounts.set(shard, 0);
+    };
     let discoveryFailures = 0;
+    let info: NodeInfo | null = opened.info;
+    let noCoverageSinceMs: number | null = null;
+    let nextPreferredProbeAtMs = this.#now() + endpoint.preferredRecoveryIntervalMs;
+    let preferredRecoverySuccesses = 0;
     try {
       while (!signal.aborted) {
         try {
-          const info = await rpc.getInfo(signal);
-          this.#updateInfo(source, info);
-          const shardIds = discoveredShardIds(info);
+          const currentInfo = info ?? await rpc.getInfo(signal);
+          info = null;
+          try {
+            validateCandidateInfo(source, opened.transport, currentInfo, endpoint.maximumBlockDelaySeconds);
+            this.#validateEndpointEnrollment(source, opened.role, opened.transport, currentInfo);
+          } catch (error) {
+            throw new ActiveEndpointUnavailable("active endpoint identity or topology changed", { cause: error });
+          }
+          this.#updateInfo(source, currentInfo);
+          const shardIds = discoveredShardIds(currentInfo);
           if (shardIds.length === 0) throw new Error("node reported zero discoverable shards");
           const desired = new Set(shardIds);
           for (const [shard, worker] of workers) {
@@ -201,22 +295,54 @@ export class CollectorRuntime {
           for (const shard of shardIds) {
             if (workers.has(shard)) continue;
             const controller = linkedAbortController(signal);
-            const promise = this.#runShard(source, shard, rpc, controller.signal)
+            const promise = this.#runShard(source, shard, rpc, controller.signal, onShardFailure, onShardHealthy)
               .catch((error) => this.#logger.error("source.shard_worker_failed", { source, shard, error }));
             workers.set(shard, { controller, promise });
             this.#logger.info("source.shard_discovered", { source, shard });
           }
           discoveryFailures = 0;
-          this.#state(source).lastContactAtMs = this.#now();
+          const state = this.#state(source);
+          state.lastContactAtMs = this.#now();
           this.#publishHealth(source);
-          await abortableDelay(this.#config.discoveryIntervalMs, signal);
+
+          if (state.connectedShards.size >= state.expectedShardCount) noCoverageSinceMs = null;
+          else if (noCoverageSinceMs === null) noCoverageSinceMs = this.#now();
+          else if (this.#now() - noCoverageSinceMs >= this.#config.disconnectedAfterMs) {
+            throw new ActiveEndpointUnavailable("active endpoint lacks complete connected data-shard coverage");
+          }
+
+          if (opened.role === "fallback" && endpoint.fallback && this.#now() >= nextPreferredProbeAtMs) {
+            try {
+              await this.#probeAndClose(source, "primary", endpoint, signal);
+              preferredRecoverySuccesses += 1;
+              if (preferredRecoverySuccesses >= endpoint.preferredRecoverySuccesses) {
+                throw new PreferredEndpointReady();
+              }
+            } catch (error) {
+              if (error instanceof PreferredEndpointReady) throw error;
+              if (signal.aborted) break;
+              preferredRecoverySuccesses = 0;
+              this.#logger.debug("source.preferred_probe_failed", { source });
+            } finally {
+              nextPreferredProbeAtMs = this.#now() + endpoint.preferredRecoveryIntervalMs;
+            }
+          }
+          const dataPlaneError = await Promise.race([
+            abortableDelay(this.#config.discoveryIntervalMs, signal).then(() => null),
+            dataPlaneFailure
+          ]);
+          if (dataPlaneError !== null) throw dataPlaneError;
         } catch (error) {
           if (signal.aborted) break;
+          if (error instanceof PreferredEndpointReady || error instanceof ActiveEndpointUnavailable) throw error;
           discoveryFailures += 1;
           const state = this.#state(source);
           state.lastError = errorMessage(error);
           state.synchronized = false;
           this.#publishHealth(source, "rpc_unavailable");
+          if (discoveryFailures >= endpoint.failoverAfterFailures) {
+            throw new ActiveEndpointUnavailable("active endpoint failed repeated discovery probes");
+          }
           const delayMs = exponentialBackoffMs(discoveryFailures - 1, { random: this.#random });
           this.#logger.warn("source.discovery_failed", { source, attempt: discoveryFailures, delayMs, error });
           await abortableDelay(delayMs, signal);
@@ -225,12 +351,141 @@ export class CollectorRuntime {
     } finally {
       for (const worker of workers.values()) worker.controller.abort();
       await Promise.all([...workers.values()].map((worker) => worker.promise));
-      rpc.close();
-      this.#clients.delete(rpc);
     }
   }
 
-  async #runShard(source: Source, shard: number, rpc: CollectorRpc, signal: AbortSignal): Promise<void> {
+  async #openFirstAvailable(source: Source, endpoint: RpcEndpointConfig): Promise<OpenEndpoint> {
+    let lastError: unknown;
+    for (const role of ["primary", "fallback"] as const) {
+      const transport = endpointForRole(endpoint, role);
+      if (!transport) continue;
+      try {
+        return await this.#openEndpoint(source, role, transport);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(`no compatible ${source} endpoint is available`);
+  }
+
+  async #openEndpoint(
+    source: Source,
+    role: EndpointRole,
+    transport: RpcTransportConfig,
+    signal?: AbortSignal
+  ): Promise<OpenEndpoint> {
+    const rpc = this.#rpcFactory(transport);
+    this.#clients.add(rpc);
+    try {
+      const info = await rpc.getInfo(signal);
+      validateCandidateInfo(source, transport, info, this.#config.endpoints[source].maximumBlockDelaySeconds);
+      if (source === "hypersnap") {
+        await this.#verifyCursorContinuity(source, role, rpc, info, signal);
+        this.#validateEndpointEnrollment(source, role, transport, info);
+      }
+      return { role, transport, rpc, info };
+    } catch (error) {
+      rpc.close();
+      this.#clients.delete(rpc);
+      throw error;
+    }
+  }
+
+  async #probeAndClose(
+    source: Source,
+    role: EndpointRole,
+    endpoint: RpcEndpointConfig,
+    signal: AbortSignal
+  ): Promise<void> {
+    const transport = endpointForRole(endpoint, role);
+    if (!transport) throw new Error(`${role} endpoint is not configured`);
+    const opened = await this.#openEndpoint(source, role, transport, signal);
+    opened.rpc.close();
+    this.#clients.delete(opened.rpc);
+  }
+
+  #validateEndpointEnrollment(
+    source: Source,
+    role: EndpointRole,
+    transport: RpcTransportConfig,
+    info: NodeInfo
+  ): void {
+    if (source !== "hypersnap") return;
+    if (!info.peerId) throw new Error("Hypersnap endpoint did not expose a peer identity");
+    this.#database.validateOrEnrollSourceEndpoint({
+      source,
+      role,
+      transport: transport.transport,
+      canonicalUrl: canonicalTransportUrl(transport),
+      peerId: info.peerId,
+      version: info.version,
+      shardIds: discoveredShardIds(info)
+    }, this.#now());
+  }
+
+  async #verifyCursorContinuity(
+    source: Source,
+    role: EndpointRole,
+    rpc: CollectorRpc,
+    info: NodeInfo,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const shards = discoveredShardIds(info);
+    const advertised = new Set(shards);
+    for (const cursor of this.#database.getCursors().filter((item) => item.source === source)) {
+      if (!advertised.has(cursor.shard)) throw new Error("candidate endpoint is missing a durable cursor shard");
+    }
+    for (const shard of shards) {
+      const cursor = this.#database.getCursor(source, shard);
+      if (cursor === "0") continue;
+      const event = await rpc.getEvent(shard, cursor, signal);
+      if (rawEventId(event) !== cursor || rawEventShard(event, shard) !== shard) {
+        throw new Error("candidate endpoint failed durable cursor continuity verification");
+      }
+      const knownFingerprint = this.#database.eventFingerprint(source, shard, cursor);
+      if (knownFingerprint === null) {
+        if (role === "fallback") {
+          throw new Error("fallback endpoint cannot establish an unbound legacy cursor fingerprint");
+        }
+      } else if (rawHubEventFingerprint(event, shard) !== knownFingerprint) {
+        throw new Error("candidate endpoint event fingerprint conflicted with the durable cursor");
+      }
+    }
+  }
+
+  #markEndpointUnavailable(source: Source): void {
+    const state = this.#state(source);
+    state.synchronized = false;
+    state.lastError = "endpoint_unavailable";
+    this.#publishHealth(source, "rpc_unavailable");
+  }
+
+  #resetSessionState(source: Source): void {
+    const state = this.#state(source);
+    state.version = "unknown";
+    state.shardIds.clear();
+    state.expectedShardCount = 0;
+    state.connectedShards.clear();
+    state.replayingShards.clear();
+    state.height = null;
+    state.blockDelaySeconds = null;
+    state.mempoolSize = null;
+    state.synchronized = false;
+    state.lastContactAtMs = null;
+    state.reconciliationState = "gap";
+    state.lastError = "endpoint_switching";
+    state.activeEndpointRole = null;
+    this.#publishHealth(source, "endpoint_switching");
+  }
+
+  async #runShard(
+    source: Source,
+    shard: number,
+    rpc: CollectorRpc,
+    signal: AbortSignal,
+    onFailure: (shard: number) => void,
+    onHealthy: (shard: number) => void
+  ): Promise<void> {
     const mode = this.#config.endpoints[source].sourceMode;
     let reconnectAttempt = 0;
     while (!signal.aborted) {
@@ -293,6 +548,7 @@ export class CollectorRuntime {
         catchup = false;
         state.replayingShards.delete(shard);
         state.reconciliationState = "ok";
+        onHealthy(shard);
         state.lastContactAtMs = this.#now();
         this.#publishHealth(source);
         this.#logger.info("source.catchup_complete", { source, shard, cursor: catchupWatermark, events: initial.eventCount });
@@ -320,6 +576,7 @@ export class CollectorRuntime {
         state.connectedShards.delete(shard);
         state.replayingShards.delete(shard);
         state.reconnectCount += 1;
+        onFailure(shard);
         state.lastError = errorMessage(error);
         state.reconciliationState = "gap";
         this.#publishHealth(source, "subscription_interrupted");
@@ -382,7 +639,6 @@ export class CollectorRuntime {
     if (!adapter || adapter.sourceMode !== mode) throw new Error(`missing ${source} activity adapter for ${mode} mode`);
     let activity = adapter.normalize(event, receivedAtMs, replay);
     const authoritativeAtMs = activity?.actionAtMs ?? eventTimeMs(event);
-    if (authoritativeAtMs !== null) this.#database.recordHistoryCoverage(source, shard, authoritativeAtMs);
     if (activity && activity.actionAtMs < cutoffMs) activity = null;
     if (!activity && authoritativeAtMs !== null && authoritativeAtMs < cutoffMs) return;
     const result = this.#database.recordEvent({
@@ -390,9 +646,11 @@ export class CollectorRuntime {
       shard,
       eventId,
       eventType: rawEventType(event),
+      eventFingerprint: rawHubEventFingerprint(event, shard),
       receivedAtMs,
       activity
     });
+    if (authoritativeAtMs !== null) this.#database.recordHistoryCoverage(source, shard, authoritativeAtMs);
     if (result.actionInserted && activity && shouldEmitPulse(activity)) this.#pulse.add({ activity, eventId });
     const state = this.#state(source);
     state.lastContactAtMs = receivedAtMs;
@@ -490,7 +748,9 @@ export class CollectorRuntime {
         historyCoverageStartMs,
         historyComplete: completeHistory
       },
-      message: message ?? (state.lastError ? "source_unavailable" : null)
+      message: message ?? (state.activeEndpointRole === "fallback"
+        ? "Public HTTPS fallback active; this remains a derived canonical-event view."
+        : state.lastError ? "source_unavailable" : null)
     };
     this.#database.upsertSourceHealth(record);
   }
@@ -535,7 +795,8 @@ function initialState(source: Source, sourceMode: SourceMode): SourceRuntimeStat
     mempoolSize: null,
     synchronized: false,
     lastContactAtMs: null,
-    lastError: null
+    lastError: null,
+    activeEndpointRole: null
   };
 }
 
@@ -596,4 +857,47 @@ function eventTimeMs(event: RawHubEvent): number | null {
 
 function historyComplete(startMs: number | null, nowMs: number): boolean {
   return startMs !== null && startMs <= nowMs - 30 * 86_400_000;
+}
+
+function endpointForRole(endpoint: RpcEndpointConfig, role: EndpointRole): RpcTransportConfig | undefined {
+  return role === "primary" ? endpoint : endpoint.fallback;
+}
+
+function alternateRole(role: EndpointRole, endpoint: RpcEndpointConfig): EndpointRole {
+  return role === "primary" && endpoint.fallback ? "fallback" : "primary";
+}
+
+export function validateCandidateInfo(
+  source: Source,
+  transport: RpcTransportConfig,
+  info: NodeInfo,
+  maximumBlockDelaySeconds: number
+): void {
+  if (transport.expectedPeerId && info.peerId !== transport.expectedPeerId) {
+    throw new Error("endpoint peer identity did not match the configured pin");
+  }
+  if (transport.expectedVersion && info.version !== transport.expectedVersion) {
+    throw new Error("endpoint version did not match the reviewed version pin");
+  }
+  const shards = discoveredShardIds(info);
+  const positiveDescriptors = info.shardInfos.filter((item) => Number.isSafeInteger(item.shardId) && item.shardId > 0);
+  if (!Number.isSafeInteger(info.numShards) || info.numShards <= 0 || shards.length === 0) {
+    throw new Error("endpoint did not expose positive data shards");
+  }
+  if (source !== "hypersnap") return;
+  if (shards.length !== info.numShards || positiveDescriptors.length !== shards.length) {
+    throw new Error("endpoint positive data-shard topology did not exactly match its declared count");
+  }
+  const shardInfo = info.shardInfos.filter((item) => shards.includes(item.shardId));
+  if (shardInfo.some((item) => !Number.isSafeInteger(item.blockDelay) || item.blockDelay < 0 || item.blockDelay > maximumBlockDelaySeconds)) {
+    throw new Error("endpoint block delay exceeds the configured activation limit");
+  }
+}
+
+class ActiveEndpointUnavailable extends Error {}
+class PreferredEndpointReady extends Error {}
+
+function canonicalTransportUrl(transport: RpcTransportConfig): string {
+  if (transport.transport === "https-json") return new URL(transport.url).toString();
+  return transport.url.toLowerCase();
 }

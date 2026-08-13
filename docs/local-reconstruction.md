@@ -44,7 +44,7 @@ Optional by task:
 - PowerShell 5.1 or PowerShell 7 on Windows for the bootstrap and Scheduled Task scripts.
 - A local Docker engine; Docker Compose 2.24.4 or later is required only for the documented `!override` node-port fragment.
 - A Cloudflare account for remote deployment. The workspace already pins Wrangler, so no global Wrangler installation is needed.
-- Private or authenticated Snapchain-compatible gRPC endpoints for live collection.
+- A private/authenticated Snapchain-compatible gRPC endpoint for live Snapchain collection; Hypersnap may use a local gRPC node and the optional reviewed read-only HTTPS fallback.
 
 Confirm the required toolchain before installing:
 
@@ -132,9 +132,17 @@ SNAPCHAIN_GRPC_URL=127.0.0.1:3383
 HYPERSNAP_GRPC_URL=127.0.0.1:4383
 SNAPCHAIN_GRPC_TLS=false
 HYPERSNAP_GRPC_TLS=false
+HYPERSNAP_RPC_TIMEOUT_MS=5000
+HYPERSNAP_FALLBACK_HTTP_URL=https://haatz.quilibrium.com
+HYPERSNAP_FALLBACK_EXPECTED_PEER_ID=12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc
+HYPERSNAP_FALLBACK_EXPECTED_VERSION=0.13.3
 ```
 
 Both upstream node types use internal gRPC port `3383`. Port `4383` is only the loopback host remap for a co-located Hypersnap node. Never publish either native plaintext RPC port to the Internet.
+
+The public template configures local Hypersnap gRPC as preferred and an HTTPS canonical-event API as fallback. The [official Hypersnap portal](https://hypersnap.org/) listed that endpoint as healthy when the configuration was reviewed, but it does not provide historical uptime or node-age proof. Peer ID and version are exact public identity pins, not secrets; a mismatch fails closed. The HTTP API has no event stream, so the collector polls its canonical `/v1/events` route while retaining ordered reconciliation and the same durable per-shard cursors.
+
+This fallback is a convenience/trust dependency, not private reconstruction material and not an independent Hyper-write source. It keeps `HYPERSNAP_SOURCE_MODE=derived`. A live probe found only roughly three days of event retention, so a new database remains partial for the 30-day window until enough prospective history accumulates. To reconstruct without a third-party public source, leave all `HYPERSNAP_FALLBACK_*` values blank together and run only the reviewed local node; if neither is available, set `HYPERSNAP_SOURCE_MODE=unavailable`.
 
 Choose a data directory outside the Git checkout. On Windows the default is `%LOCALAPPDATA%\SnapMeter`; an explicit secondary-drive layout is also valid:
 
@@ -142,7 +150,7 @@ Choose a data directory outside the Git checkout. On Windows the default is `%LO
 SNAPMETER_DATA_DIR=D:\SnapMeter\collector
 ```
 
-The collector creates and migrates `snapmeter.sqlite3` itself, including its WAL, cursors, local identity, schema-v3 actor pseudonym key, bounded analytics state, and durable delivery outbox. These files must remain untracked. A clean reconstruction creates a new collector ID and key inside its new database; neither value comes from production or belongs in configuration. Never inspect, print, extract, or export the key separately.
+The collector creates and migrates `snapmeter.sqlite3` itself, including its WAL, cursors, local identity, schema-v4 actor pseudonym key and endpoint enrollments, bounded analytics state, and durable delivery outbox. These files must remain untracked. A clean reconstruction creates a new collector ID and key inside its new database; neither value comes from production or belongs in configuration. Never inspect, print, extract, or export the key separately.
 
 Pair that new collector only with the clean local or remote D1 dataset created for the reconstruction. Migration `0005_collector_binding.sql` makes the first non-doctor delivery claim that dataset's global collector slot; an empty doctor probe only validates access and does not claim it. An existing production D1 dataset rejects a newly reconstructed database with HTTP 409 `collector_identity_conflict`. Production failover therefore restores the entire stopped, WAL-consistent collector state rather than reconstructing a new database; follow the [Windows runbook](windows-runbook.md).
 
@@ -193,7 +201,7 @@ The last two commands must print the exact full SHAs above. Build and configure 
 
 `docker-compose.nodes.override.yml` is an illustrative Compose 2.24.4+ fragment for a separately reviewed upstream-node project. It is not a standalone node launcher. It binds Snapchain host port `3383` and Hypersnap host port `4383` to each container's internal port `3383`, both on loopback.
 
-An exact 30-day cold start requires at least 31 days of authoritative event retention or a separately trusted history source. The pinned default Snapchain HubEvent retention is only three days. Missing older history must remain visibly partial until sufficient prospective coverage accumulates.
+An exact 30-day cold start requires at least 31 days of authoritative event retention or a separately trusted history source. The pinned default Snapchain HubEvent retention is only three days, and the reviewed public Hypersnap fallback exposed a similarly short observed range. Missing older history must remain visibly partial until sufficient prospective coverage accumulates.
 
 ## Reconstruct Cloudflare resources
 

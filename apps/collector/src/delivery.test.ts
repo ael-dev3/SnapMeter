@@ -42,7 +42,15 @@ function action(source: "snapchain" | "hypersnap", fid: string, eventId: string)
 }
 
 function record(database: CollectorDatabase, activity: ActivityRecord, eventId: string) {
-  database.recordEvent({ source: activity.source, shard: 0, eventId, eventType: "MERGE_MESSAGE", receivedAtMs: activity.receivedAtMs, activity });
+  database.recordEvent({
+    source: activity.source,
+    shard: 0,
+    eventId,
+    eventType: "MERGE_MESSAGE",
+    eventFingerprint: "a".repeat(64),
+    receivedAtMs: activity.receivedAtMs,
+    activity
+  });
 }
 
 describe("pulse and batch delivery", () => {

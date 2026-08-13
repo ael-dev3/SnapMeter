@@ -58,6 +58,69 @@ describe("collector doctor", () => {
       if (resolved.startsWith(resolve(tmpdir()))) rmSync(resolved, { recursive: true, force: true });
     }
   });
+
+  it("accepts a healthy peer-pinned HTTPS fallback when the local Hypersnap endpoint is offline", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "snapmeter-doctor-fallback-test-"));
+    const peerId = "12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc";
+    const config = loadConfig({
+      SNAPMETER_DATA_DIR: directory,
+      SNAPCHAIN_SOURCE_MODE: "unavailable",
+      HYPERSNAP_FALLBACK_HTTP_URL: "https://public.example",
+      HYPERSNAP_FALLBACK_EXPECTED_PEER_ID: peerId,
+      HYPERSNAP_FALLBACK_EXPECTED_VERSION: "0.13.3",
+      SNAPMETER_MIN_FREE_DISK_BYTES: "1"
+    });
+    const database = new CollectorDatabase(config.databasePath);
+    const rpcFactory: RpcFactory = (candidate) => candidate.transport === "grpc"
+      ? { ...fakeRpc(), getInfo: async () => { throw new Error("offline"); } }
+      : {
+          ...fakeRpc(),
+          getInfo: async () => ({
+            version: "0.13.3",
+            peerId,
+            numShards: 2,
+            shardInfos: [
+              { shardId: 1, maxHeight: 20, blockDelay: 0, mempoolSize: 0 },
+              { shardId: 2, maxHeight: 20, blockDelay: 0, mempoolSize: 0 }
+            ]
+          })
+        };
+    try {
+      const report = await runDoctor({ config, database, rpcFactory, now: () => Date.UTC(2026, 7, 13, 12) });
+      expect(report.checks.find((check) => check.name === "hypersnap.rpc")).toMatchObject({
+        status: "pass",
+        details: { role: "fallback", transport: "https-json" }
+      });
+      expect(database.checkSourceEndpointEnrollment({
+        source: "hypersnap",
+        role: "fallback",
+        transport: "https-json",
+        canonicalUrl: "https://public.example/",
+        peerId,
+        version: "0.13.3",
+        shardIds: [1, 2]
+      })).toBe("unenrolled");
+
+      database.validateOrEnrollSourceEndpoint({
+        source: "hypersnap",
+        role: "fallback",
+        transport: "https-json",
+        canonicalUrl: "https://previous.example/",
+        peerId,
+        version: "0.13.3",
+        shardIds: [1, 2]
+      }, Date.UTC(2026, 7, 13, 11));
+      const mismatched = await runDoctor({ config, database, rpcFactory, now: () => Date.UTC(2026, 7, 13, 12) });
+      expect(mismatched.checks.find((check) => check.name === "hypersnap.rpc")).toMatchObject({
+        status: "fail",
+        message: "no configured endpoint passed identity, health, and cursor-continuity checks"
+      });
+    } finally {
+      database.close();
+      const resolved = resolve(directory);
+      if (resolved.startsWith(resolve(tmpdir()))) rmSync(resolved, { recursive: true, force: true });
+    }
+  });
 });
 
 function fakeRpc(): CollectorRpc {

@@ -6,8 +6,49 @@ import {
   invokeUnaryWithAbort,
   MinimumIntervalGate,
   observeSubscriptionStream,
+  rawHubEventFingerprint,
   type RawHubEvent
 } from "./rpc";
+
+describe("canonical HubEvent fingerprints", () => {
+  it("matches equivalent gRPC byte fields and HTTP hex fields", () => {
+    const common = {
+      type: "HUB_EVENT_TYPE_MERGE_MESSAGE",
+      id: "123",
+      shardIndex: 1,
+      blockNumber: "9",
+      timestamp: "101"
+    };
+    const grpc = {
+      ...common,
+      mergeMessageBody: { message: {
+        hash: Buffer.from("aabb", "hex"),
+        data: { type: "MESSAGE_TYPE_CAST_ADD", fid: "42", timestamp: "100", network: "FARCASTER_NETWORK_MAINNET" }
+      } }
+    } satisfies RawHubEvent;
+    const http = {
+      ...common,
+      mergeMessageBody: { message: {
+        hash: "0xaabb",
+        data: { type: 1, fid: "42", timestamp: 100, network: 1 }
+      } }
+    } satisfies RawHubEvent;
+    expect(rawHubEventFingerprint(grpc, 1)).toBe(rawHubEventFingerprint(http, 1));
+    expect(rawHubEventFingerprint({ ...http, mergeMessageBody: { message: {
+      ...http.mergeMessageBody.message,
+      data: { ...http.mergeMessageBody.message.data, fid: "43" }
+    } } }, 1)).not.toBe(rawHubEventFingerprint(http, 1));
+    expect(rawHubEventFingerprint({ ...http, timestamp: "102" }, 1))
+      .not.toBe(rawHubEventFingerprint(http, 1));
+  });
+
+  it("normalizes the channel-owner hint enum consistently across transports", () => {
+    const common = { id: "147456", shardIndex: 1, blockNumber: "9", timestamp: "101" };
+    expect(rawHubEventFingerprint({ ...common, type: 12 }, 1)).toBe(
+      rawHubEventFingerprint({ ...common, type: "HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT" }, 1)
+    );
+  });
+});
 
 describe("Snapchain RPC metadata", () => {
   it("sends proxy authorization and hosted-provider API keys under distinct headers", () => {
@@ -84,6 +125,47 @@ describe("Snapchain live subscription request", () => {
     await rejection;
     await subscription.done;
     expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains an observer exception before readiness and terminates the stream", async () => {
+    const emitter = new EventEmitter();
+    const cancel = vi.fn();
+    const stream = Object.assign(emitter, { cancel }) as unknown as Parameters<typeof observeSubscriptionStream>[0];
+    const failure = new Error("event fingerprint conflict");
+    const onError = vi.fn();
+    const subscription = observeSubscriptionStream(stream, () => { throw failure; }, onError);
+    const rejection = expect(subscription.ready).rejects.toBe(failure);
+
+    expect(() => emitter.emit("data", { id: "123" } satisfies RawHubEvent)).not.toThrow();
+
+    await rejection;
+    await subscription.done;
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(failure);
+    expect(cancel).toHaveBeenCalledOnce();
+    subscription.cancel();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("contains an observer exception after readiness and reports it once", async () => {
+    const emitter = new EventEmitter();
+    const cancel = vi.fn();
+    const stream = Object.assign(emitter, { cancel }) as unknown as Parameters<typeof observeSubscriptionStream>[0];
+    const failure = new Error("late event fingerprint conflict");
+    const onError = vi.fn(() => { throw new Error("observer error handler failed"); });
+    const onEvent = vi.fn((event: RawHubEvent) => {
+      if (event.id === "124") throw failure;
+    });
+    const subscription = observeSubscriptionStream(stream, onEvent, onError);
+
+    emitter.emit("data", { id: "123" } satisfies RawHubEvent);
+    await subscription.ready;
+    expect(() => emitter.emit("data", { id: "124" } satisfies RawHubEvent)).not.toThrow();
+
+    await subscription.done;
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(failure);
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });
 

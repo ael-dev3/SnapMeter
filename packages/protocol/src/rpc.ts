@@ -1,7 +1,8 @@
 import { credentials, loadPackageDefinition, Metadata, type ClientReadableStream, type ClientUnaryCall, type ServiceError } from "@grpc/grpc-js";
 import { loadSync } from "@grpc/proto-loader";
 import { fileURLToPath } from "node:url";
-import { actionFamilyForMessage, isHyperEligible } from "./classifier";
+import { createHash } from "node:crypto";
+import { actionFamilyForMessage, isHyperEligible, messageTypeNumber } from "./classifier";
 import type { Source, SourceMode } from "@snapmeter/contracts";
 import type { ActivityRecord } from "@snapmeter/metrics";
 
@@ -25,6 +26,7 @@ export interface ShardInfo {
 
 export interface NodeInfo {
   version: string;
+  peerId?: string;
   numShards: number;
   shardInfos: ShardInfo[];
 }
@@ -35,8 +37,41 @@ export interface RawHubEvent {
   shardIndex?: number;
   timestamp?: number | string;
   blockNumber?: number | string;
-  mergeMessageBody?: { message?: { data?: { type?: number | string; fid?: number | string; timestamp?: number | string } } };
+  mergeMessageBody?: {
+    message?: {
+      data?: { type?: number | string; fid?: number | string; timestamp?: number | string; network?: number | string };
+      hash?: unknown;
+    };
+  };
   blockConfirmedBody?: Record<string, unknown>;
+}
+
+export function rawHubEventFingerprint(event: RawHubEvent, fallbackShard: number): string {
+  const merge = event.mergeMessageBody?.message;
+  const data = merge?.data;
+  const block = event.blockConfirmedBody;
+  const canonical = JSON.stringify({
+    type: hubEventTypeNumber(event.type),
+    id: exactIntegerText(event.id),
+    shard: Number(event.shardIndex) > 0 ? Number(event.shardIndex) : fallbackShard,
+    blockNumber: exactIntegerText(event.blockNumber),
+    timestamp: exactIntegerText(event.timestamp),
+    message: data ? {
+      type: messageTypeNumber(data.type),
+      fid: exactIntegerText(data.fid),
+      timestamp: exactIntegerText(data.timestamp),
+      network: networkNumber(data.network),
+      hash: byteLikeText(merge?.hash)
+    } : null,
+    confirmed: block ? {
+      blockNumber: exactIntegerText(block.blockNumber),
+      shard: Number(block.shardIndex ?? fallbackShard),
+      timestamp: exactIntegerText(block.timestamp),
+      blockHash: byteLikeText(block.blockHash),
+      totalEvents: exactIntegerText(block.totalEvents)
+    } : null
+  });
+  return createHash("sha256").update("snapmeter-hub-event-v1\0").update(canonical).digest("hex");
 }
 
 export interface ProtocolRpcSubscription {
@@ -105,7 +140,13 @@ export class SnapchainRpcClient {
       mempoolSize: Number(shard.mempoolSize ?? 0)
     })) : [];
     const declared = Number(response.numShards ?? 0);
-    return { version: String(response.version ?? "unknown"), numShards: declared || shardInfos.filter((shard) => shard.shardId > 0).length, shardInfos };
+    const peerId = String(response.peerId ?? response.peer_id ?? "").trim();
+    return {
+      version: String(response.version ?? "unknown"),
+      ...(peerId ? { peerId } : {}),
+      numShards: declared || shardInfos.filter((shard) => shard.shardId > 0).length,
+      shardInfos
+    };
   }
 
   async getEvent(shardIndex: number, id: string, signal?: AbortSignal): Promise<RawHubEvent> {
@@ -212,6 +253,7 @@ export function observeSubscriptionStream(
     let rejectReady: ((error: Error) => void) | undefined;
     let readySettled = false;
     let doneSettled = false;
+    let cancelIssued = false;
     const ready = new Promise<void>((resolve, reject) => {
       resolveReady = resolve;
       rejectReady = reject;
@@ -232,17 +274,40 @@ export function observeSubscriptionStream(
       doneSettled = true;
       settleDone?.();
     };
+    const reportError = (error: Error): void => {
+      try {
+        onError(error);
+      } catch {
+        // Observer error handlers must never become uncaught EventEmitter errors.
+      }
+    };
+    const cancelUnderlying = (): void => {
+      if (cancelIssued) return;
+      cancelIssued = true;
+      try { stream.cancel(); } catch { /* cancellation is best-effort */ }
+    };
+    const terminateWithError = (error: Error, cancelStream: boolean): void => {
+      if (doneSettled) return;
+      failBeforeReady(error);
+      reportError(error);
+      finish();
+      if (cancelStream) cancelUnderlying();
+    };
     stream.on("data", (event: RawHubEvent) => {
+      if (doneSettled) return;
       // Snapchain sends response metadata before its spawned subscription task
       // installs the broadcast receiver. Incorporate the first data event
       // before declaring readiness so the subsequent fixed-bound replay sees it.
-      onEvent(event);
+      try {
+        onEvent(event);
+      } catch (error) {
+        terminateWithError(error instanceof Error ? error : new Error(String(error)), true);
+        return;
+      }
       markReady();
     });
     stream.on("error", (error: Error) => {
-      failBeforeReady(error);
-      onError(error);
-      finish();
+      terminateWithError(error, false);
     });
     stream.on("end", () => {
       failBeforeReady(new Error("subscription ended before becoming ready"));
@@ -256,7 +321,7 @@ export function observeSubscriptionStream(
       cancel: () => {
         failBeforeReady(rpcAbortError("subscription cancelled"));
         finish();
-        stream.cancel();
+        cancelUnderlying();
       },
       ready,
       done
@@ -366,6 +431,7 @@ export function normalizeMergeEvent(
   if (event.type !== 1 && event.type !== "1" && event.type !== "HUB_EVENT_TYPE_MERGE_MESSAGE") return null;
   const data = event.mergeMessageBody?.message?.data;
   if (!data) return null;
+  if (source === "hypersnap" && networkNumber(data.network) !== 1) return null;
   const family = actionFamilyForMessage(data.type);
   if (!family) return null;
   if (source === "hypersnap" && sourceMode === "derived" && !isHyperEligible(data.type)) return null;
@@ -388,4 +454,61 @@ export function normalizeMergeEvent(
     receivedAtMs,
     isReplay
   };
+}
+
+function hubEventTypeNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string") {
+    if (/^\d+$/.test(value)) return Number(value);
+    const known: Record<string, number> = {
+      HUB_EVENT_TYPE_NONE: 0,
+      HUB_EVENT_TYPE_MERGE_MESSAGE: 1,
+      HUB_EVENT_TYPE_PRUNE_MESSAGE: 2,
+      HUB_EVENT_TYPE_REVOKE_MESSAGE: 3,
+      HUB_EVENT_TYPE_MERGE_USERNAME_PROOF: 6,
+      HUB_EVENT_TYPE_MERGE_ON_CHAIN_EVENT: 9,
+      HUB_EVENT_TYPE_MERGE_FAILURE: 10,
+      HUB_EVENT_TYPE_BLOCK_CONFIRMED: 11,
+      HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT: 12
+    };
+    return known[value] ?? null;
+  }
+  return null;
+}
+
+function networkNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string") {
+    if (/^\d+$/.test(value)) return Number(value);
+    const known: Record<string, number> = {
+      FARCASTER_NETWORK_NONE: 0,
+      FARCASTER_NETWORK_MAINNET: 1,
+      FARCASTER_NETWORK_TESTNET: 2,
+      FARCASTER_NETWORK_DEVNET: 3
+    };
+    return known[value] ?? null;
+  }
+  return null;
+}
+
+function exactIntegerText(value: unknown): string | null {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isSafeInteger(value)) return String(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) return BigInt(value).toString();
+  return null;
+}
+
+function byteLikeText(value: unknown): string | null {
+  if (value instanceof Uint8Array) return Buffer.from(value).toString("hex");
+  if (typeof value !== "string" || value.length > 4_096) return null;
+  if (/^0x[0-9a-f]+$/i.test(value)) return value.slice(2).toLowerCase();
+  try {
+    const bytes = Buffer.from(value, "base64");
+    if (bytes.length > 0 && bytes.toString("base64").replace(/=+$/, "") === value.replace(/=+$/, "")) {
+      return bytes.toString("hex");
+    }
+  } catch {
+    // Non-binary strings are still normalized below.
+  }
+  return value;
 }

@@ -2,9 +2,9 @@
 
 ## Assets and trust boundaries
 
-Sensitive assets are the ingest HMAC secret, optional RPC authorization/API-key metadata, Cloudflare API token/account configuration, local actor/cursor database, and retry outbox. The schema-v3 collector database also contains the authoritative collector ID and actor pseudonym key. The public dashboard, summary APIs, and WebSocket clients are untrusted readers. Node RPC endpoints and collector state stay private.
+Sensitive assets are the ingest HMAC secret, optional RPC authorization/API-key metadata, Cloudflare API token/account configuration, local actor/cursor database, and retry outbox. The schema-v4 collector database also contains the authoritative collector ID, actor pseudonym key, endpoint enrollments, and event fingerprints. The public dashboard, summary APIs, WebSocket clients, and optional third-party Hypersnap HTTPS replica are untrusted. Native node RPC endpoints and collector state stay private.
 
-Primary threats are forged/replayed ingest, duplicate or out-of-order delivery, secret leakage through logs/bundles, public node exposure, oversized/schema-confusing requests, SQL injection, source-quality spoofing, WebSocket abuse, and unbounded local/cloud storage.
+Primary threats are forged/replayed ingest, duplicate or out-of-order delivery, secret leakage through logs/bundles, public node exposure, malicious or drifting fallback data, oversized/schema-confusing requests, SQL injection, source-quality spoofing, WebSocket abuse, and unbounded local/cloud storage.
 
 ## Ingest controls
 
@@ -35,7 +35,7 @@ Migration `0005_collector_binding.sql` gives each D1 dataset one global `collect
 
 For failover, stop the collector and take a SQLite-consistent backup of the entire collector state, including `snapmeter.sqlite3` and any associated WAL/SHM state. Restore or clone that stopped state as one unit so the collector ID, pseudonym key, cursors, deduplication records, and outbox stay aligned. Never inspect, print, extract, export, copy, or persist the pseudonym key separately. A fresh database is a new collector identity and is not a replacement for this backup.
 
-Accepting an intentionally new database requires an explicit operator reset of the D1 collector binding: `DELETE FROM collector_binding WHERE slot=1`. Perform that statement only after backing up D1 and completing the metric-continuity plan. Treat the reset as a metric-data boundary: preferably perform it at a UTC-day boundary when no reconciliation will add actors to earlier retained days, or clear and deliberately rebuild the affected cloud actor-day membership before accepting the new ID. Changing the ingest secret does not reset this binding. Schema v3 is forward-only; if a release fails after migration, restore the stopped pre-upgrade database with its compatible binary or fix forward, rather than running a pre-v3 binary against a v3 database.
+Accepting an intentionally new database requires an explicit operator reset of the D1 collector binding: `DELETE FROM collector_binding WHERE slot=1`. Perform that statement only after backing up D1 and completing the metric-continuity plan. Treat the reset as a metric-data boundary: preferably perform it at a UTC-day boundary when no reconciliation will add actors to earlier retained days, or clear and deliberately rebuild the affected cloud actor-day membership before accepting the new ID. Changing the ingest secret does not reset this binding. Schema v4 is forward-only; if a release fails after migration, restore the stopped pre-upgrade database with its compatible binary or fix forward, rather than running a pre-v4 binary against a v4 database.
 
 ## Secrets
 
@@ -49,9 +49,27 @@ Accepting an intentionally new database requires an explicit operator reset of t
 
 If a secret is exposed, stop affected ingest, rotate the Worker secret/token, update collectors securely, review replay/idempotency logs, and invalidate the old value. Git history rewriting is a separate release-owner decision; deleting a working-tree file alone is insufficient.
 
+## Public Hypersnap fallback
+
+The optional fallback is a read-only public HTTPS dependency and receives no SnapMeter ingest secret, API key, authorization metadata, cookie, raw browser request, or private collector state. Requests use `GET`, `Accept: application/json`, no credentials/cache, no redirects, bounded response bodies, strict JSON/type/uint64 validation, timeouts, and global request-start pacing.
+
+Controls before either Hypersnap role can become active include:
+
+- exact configured version and peer-ID pins for the public role;
+- HTTPS hostname authentication with embedded URL credentials/query/fragment rejected;
+- full positive-shard coverage and a bounded block-delay threshold;
+- durable enrollment of role, transport, canonical URL, peer ID, version, and shard set;
+- `GetEvent`/`eventById` cursor continuity and a SHA-256 fingerprint match against locally observed normalized event content;
+- one active role at a time, followed by inclusive reconciliation and deduplication on every switch;
+- hysteresis before returning to the preferred local node.
+
+These controls limit accidental drift, replay discontinuity, and equivocation against already observed history. They do not turn a public operator into a trusted authority: `/v1/info` self-reports the peer ID/version, TLS authenticates only the hostname, and an endpoint can still lie consistently about previously unseen canonical events. The fallback therefore remains `derived`, its availability is not an uptime claim, and operators who cannot accept the dependency must disable all fallback identity/URL values together or mark Hypersnap unavailable.
+
+The checked-in peer ID, version, and public URL are not secrets. An exact pin or durable enrollment mismatch is an intentional stop condition. Do not bypass it by deleting the collector database/enrollment; review the endpoint/upstream change, back up state, and ship an explicit re-enrollment migration.
+
 ## Network and browser
 
-Bind local native gRPC to loopback/private interfaces; it is plaintext at the inspected upstream commits. Use TLS termination and optional authorization for remote access. Never open inbound public firewall rules for collector convenience.
+Bind local native gRPC to loopback/private interfaces; it is plaintext at the inspected upstream commits. Use TLS termination and optional authorization for remote gRPC access. Never open inbound public firewall rules for collector convenience. The Hypersnap fallback is outbound HTTPS only; the upstream [operator guide](https://hypersnap.org/run-a-node) does not justify exposing local `3381`/`3383` ports.
 
 Read APIs are same-origin by default. Apply restrictive security headers, no permissive credentialed CORS, and a CSP appropriate for bundled assets/WebSockets. Public WebSockets are read-only, schema-versioned, rate/connection-limited, and receive only aggregate packets. Durable Object messages must not contain secrets or raw social content.
 

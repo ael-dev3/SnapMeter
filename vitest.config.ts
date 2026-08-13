@@ -4,7 +4,9 @@ export default defineConfig({
   test: {
     include: ["packages/**/*.test.ts", "apps/collector/src/**/*.test.ts"],
     maxWorkers: 4,
-    testTimeout: 15_000,
+    // Real SQLite/WAL migration and network-free collector integration tests
+    // can contend on Windows when four workers run concurrently.
+    testTimeout: 30_000,
     coverage: {
       provider: "v8",
       reporter: ["text", "json-summary"],

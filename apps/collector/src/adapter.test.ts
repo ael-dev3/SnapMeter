@@ -12,14 +12,14 @@ describe("source activity adapters", () => {
       shardIndex: 1,
       type: "HUB_EVENT_TYPE_MERGE_MESSAGE",
       timestamp,
-      mergeMessageBody: { message: { data: { type: "MESSAGE_TYPE_CAST_ADD", fid: "1", timestamp } } }
+      mergeMessageBody: { message: { data: { type: "MESSAGE_TYPE_CAST_ADD", fid: "1", timestamp, network: "FARCASTER_NETWORK_MAINNET" } } }
     }, Date.now(), false)?.action).toBe("cast");
     expect(adapter.normalize({
       id: "2",
       shardIndex: 1,
       type: "HUB_EVENT_TYPE_MERGE_MESSAGE",
       timestamp,
-      mergeMessageBody: { message: { data: { type: "MESSAGE_TYPE_CHANNEL_UPDATE", fid: "1", timestamp } } }
+      mergeMessageBody: { message: { data: { type: "MESSAGE_TYPE_CHANNEL_UPDATE", fid: "1", timestamp, network: 1 } } }
     }, Date.now(), false)).toBeNull();
   });
 

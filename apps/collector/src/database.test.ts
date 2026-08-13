@@ -22,7 +22,15 @@ function action(source: "snapchain" | "hypersnap", fid: string, eventId: string,
 }
 
 function record(database: CollectorDatabase, activity: ActivityRecord, eventId: string, shard = 0) {
-  return database.recordEvent({ source: activity.source, shard, eventId, eventType: "MERGE_MESSAGE", receivedAtMs: activity.receivedAtMs, activity });
+  return database.recordEvent({
+    source: activity.source,
+    shard,
+    eventId,
+    eventType: "MERGE_MESSAGE",
+    eventFingerprint: "a".repeat(64),
+    receivedAtMs: activity.receivedAtMs,
+    activity
+  });
 }
 
 describe("collector SQLite state", () => {
@@ -36,6 +44,51 @@ describe("collector SQLite state", () => {
       expect(database.status()).toMatchObject({ actions: 3, dedupeEvents: 3, actorDays: 2, minuteBuckets: 1 });
       expect(database.pendingMinuteBuckets(NOW + 60_000)[0]).toMatchObject({ actions: 3, uniqueFids: 2 });
       expect(database.integrityCheck()).toBe("ok");
+    } finally {
+      database.close();
+    }
+  });
+
+  it("fails closed when an endpoint supplies conflicting content for an existing event id", () => {
+    const database = new CollectorDatabase(":memory:");
+    try {
+      record(database, action("hypersnap", "10", "100"), "100", 1);
+      expect(database.eventFingerprint("hypersnap", 1, "100")).toBe("a".repeat(64));
+      expect(() => database.recordEvent({
+        source: "hypersnap",
+        shard: 1,
+        eventId: "100",
+        eventType: "MERGE_MESSAGE",
+        eventFingerprint: "b".repeat(64),
+        receivedAtMs: NOW,
+        activity: null
+      })).toThrow(/fingerprint conflict/);
+      expect(database.status().dedupeEvents).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("durably pins endpoint identity and rejects silent peer, version, or topology changes", () => {
+    const database = new CollectorDatabase(":memory:");
+    const enrollment = {
+      source: "hypersnap" as const,
+      role: "fallback" as const,
+      transport: "https-json" as const,
+      canonicalUrl: "https://public.example/",
+      peerId: "12D3KooWPeer",
+      version: "0.13.3",
+      shardIds: [2, 1]
+    };
+    try {
+      database.validateOrEnrollSourceEndpoint(enrollment, NOW);
+      database.validateOrEnrollSourceEndpoint({ ...enrollment, shardIds: [1, 2] }, NOW + 1);
+      expect(() => database.validateOrEnrollSourceEndpoint({ ...enrollment, peerId: "12D3KooWChanged" }, NOW + 2))
+        .toThrow(/identity changed/);
+      expect(() => database.validateOrEnrollSourceEndpoint({ ...enrollment, version: "0.13.4" }, NOW + 3))
+        .toThrow(/identity changed/);
+      expect(() => database.validateOrEnrollSourceEndpoint({ ...enrollment, shardIds: [1] }, NOW + 4))
+        .toThrow(/identity changed/);
     } finally {
       database.close();
     }
@@ -148,7 +201,7 @@ describe("collector SQLite state", () => {
 
       const upgraded = new CollectorDatabase(path);
       try {
-        expect(upgraded.status().schemaVersion).toBe(3);
+        expect(upgraded.status().schemaVersion).toBe(4);
         expect(upgraded.loadActions("snapchain", 0).map((item) => item.fid)).toEqual(["77"]);
         expect(upgraded.getCursor("snapchain", 3)).toBe("700");
         upgraded.recordHistoryCoverage("snapchain", 3, NOW - 31 * 86_400_000);
@@ -156,6 +209,98 @@ describe("collector SQLite state", () => {
       } finally {
         upgraded.close();
       }
+    } finally {
+      const resolved = resolve(directory);
+      if (resolved.startsWith(resolve(tmpdir()))) rmSync(resolved, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates a genuine version-3 schema, preserves legacy rows, and reopens with durable enrollment", () => {
+    const directory = mkdtempSync(join(tmpdir(), "snapmeter-v3-migration-test-"));
+    const path = join(directory, "state.sqlite3");
+    try {
+      const seeded = new CollectorDatabase(path);
+      record(seeded, action("hypersnap", "77", "700"), "700", 3);
+      seeded.checkpointCursor("hypersnap", 3, "700", NOW);
+      seeded.close();
+      downgradeToVersion3(path);
+
+      const upgraded = new CollectorDatabase(path);
+      expect(upgraded.status().schemaVersion).toBe(4);
+      expect(upgraded.eventFingerprint("hypersnap", 3, "700")).toBeNull();
+      expect(upgraded.getCursor("hypersnap", 3)).toBe("700");
+      expect(upgraded.loadActions("hypersnap", 0).map((item) => item.fid)).toEqual(["77"]);
+      expect(upgraded.recordEvent({
+        source: "hypersnap",
+        shard: 3,
+        eventId: "700",
+        eventType: "MERGE_MESSAGE",
+        eventFingerprint: "b".repeat(64),
+        receivedAtMs: NOW,
+        activity: null
+      })).toMatchObject({ duplicate: true });
+      const enrollment = {
+        source: "hypersnap" as const,
+        role: "fallback" as const,
+        transport: "https-json" as const,
+        canonicalUrl: "https://public.example/",
+        peerId: "12D3KooWPeer",
+        version: "0.13.3",
+        shardIds: [3]
+      };
+      upgraded.validateOrEnrollSourceEndpoint(enrollment, NOW);
+      upgraded.close();
+
+      const reopened = new CollectorDatabase(path);
+      expect(reopened.eventFingerprint("hypersnap", 3, "700")).toBe("b".repeat(64));
+      expect(reopened.checkSourceEndpointEnrollment(enrollment)).toBe("match");
+      reopened.close();
+    } finally {
+      const resolved = resolve(directory);
+      if (resolved.startsWith(resolve(tmpdir()))) rmSync(resolved, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back every version-4 schema change when migration fails", () => {
+    const directory = mkdtempSync(join(tmpdir(), "snapmeter-v4-rollback-test-"));
+    const path = join(directory, "state.sqlite3");
+    try {
+      const seeded = new CollectorDatabase(path);
+      seeded.close();
+      downgradeToVersion3(path);
+      const blocked = new DatabaseSync(path);
+      blocked.exec(`
+        CREATE TRIGGER block_v4_migration
+        BEFORE INSERT ON schema_migrations
+        WHEN NEW.version = 4
+        BEGIN
+          SELECT RAISE(ABORT, 'blocked version-4 migration');
+        END;
+      `);
+      blocked.close();
+
+      expect(() => new CollectorDatabase(path)).toThrow();
+
+      const inspected = new DatabaseSync(path);
+      const columns = inspected.prepare("PRAGMA table_info(event_dedupe)").all() as Array<{ name: string }>;
+      const migration = inspected.prepare("SELECT COUNT(*) AS total FROM schema_migrations WHERE version = 4")
+        .get() as { total: number };
+      const v4Objects = inspected.prepare(`
+        SELECT COUNT(*) AS total FROM sqlite_schema
+        WHERE type = 'table' AND name IN ('source_endpoint_enrollment', 'active_source_endpoint')
+      `).get() as { total: number };
+      const metadata = inspected.prepare("SELECT value FROM collector_metadata WHERE key = 'schema_version'")
+        .get() as { value: string };
+      expect(columns.some((column) => column.name === "event_fingerprint")).toBe(false);
+      expect(Number(migration.total)).toBe(0);
+      expect(Number(v4Objects.total)).toBe(0);
+      expect(metadata.value).toBe("3");
+      inspected.exec("DROP TRIGGER block_v4_migration");
+      inspected.close();
+
+      const recovered = new CollectorDatabase(path);
+      expect(recovered.status().schemaVersion).toBe(4);
+      recovered.close();
     } finally {
       const resolved = resolve(directory);
       if (resolved.startsWith(resolve(tmpdir()))) rmSync(resolved, { recursive: true, force: true });
@@ -178,7 +323,7 @@ describe("collector SQLite state", () => {
       legacy.close();
 
       const upgraded = new CollectorDatabase(path);
-      expect(upgraded.status().schemaVersion).toBe(3);
+      expect(upgraded.status().schemaVersion).toBe(4);
       expect(upgraded.actorDayPseudonym("snapchain", "2026-08-13", "77")).toMatch(/^[0-9a-f]{64}$/);
       expect(() => upgraded.setMetadata("actor_pseudonym_key_v1", "attacker-controlled"))
         .toThrow(/unsupported runtime metadata key/);
@@ -234,7 +379,7 @@ describe("collector SQLite state", () => {
       legacy.close();
 
       const upgraded = new CollectorDatabase(path);
-      expect(upgraded.status().schemaVersion).toBe(3);
+      expect(upgraded.status().schemaVersion).toBe(4);
       expect(upgraded.dueOutbox(NOW)[0]?.payloadJson).toBe(payload);
       expect(upgraded.pendingActorDays()).toEqual([]);
       upgraded.close();
@@ -278,3 +423,28 @@ describe("collector SQLite state", () => {
     }
   });
 });
+
+function downgradeToVersion3(path: string): void {
+  const database = new DatabaseSync(path);
+  database.exec(`
+    DROP TABLE source_endpoint_enrollment;
+    DROP TABLE active_source_endpoint;
+    DROP INDEX event_dedupe_retention_idx;
+    ALTER TABLE event_dedupe RENAME TO event_dedupe_v4;
+    CREATE TABLE event_dedupe (
+      source TEXT NOT NULL CHECK (source IN ('snapchain', 'hypersnap')),
+      shard INTEGER NOT NULL CHECK (shard >= 0),
+      event_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      received_at_ms INTEGER NOT NULL,
+      PRIMARY KEY (source, shard, event_id)
+    ) STRICT;
+    INSERT INTO event_dedupe(source, shard, event_id, event_type, received_at_ms)
+      SELECT source, shard, event_id, event_type, received_at_ms FROM event_dedupe_v4;
+    DROP TABLE event_dedupe_v4;
+    CREATE INDEX event_dedupe_retention_idx ON event_dedupe(received_at_ms);
+    DELETE FROM schema_migrations WHERE version = 4;
+    UPDATE collector_metadata SET value = '3' WHERE key = 'schema_version';
+  `);
+  database.close();
+}

@@ -12,6 +12,7 @@ The public origin, API, authenticated ingest, D1 persistence, WebSocket hydratio
 
 - **Snapchain** uses successful canonical `MERGE_MESSAGE` HubEvents, so its evidence mode is `verified`; a separate status becomes stale, degraded, partial, or disconnected when coverage, freshness, or reconciliation is unhealthy.
 - **Hypersnap** is currently reported as **Hypersnap observed active FIDs** with a visible `DERIVED` state. The value is inferred from successful canonical merges seen through the configured Hypersnap node whose message types are eligible for its Hyper shadow stores. Upstream exposes no per-write Hyper success stream, so SnapMeter does not claim those shadow writes were independently verified.
+- **Hypersnap endpoint failover** keeps one canonical source active at a time: the preferred local gRPC node first, then an identity-pinned HTTPS canonical-event replica if local is unavailable, and back to local only after repeated healthy probes and cursor/fingerprint continuity checks. A fallback does not make the metric verified or complete.
 - **Unavailable, stale, degraded, and partial** states stay visible. Loading the website does not make a source live.
 
 See [Data sources](docs/data-sources.md), [upstream pins](docs/upstream-sources.md), and the [complete metric policy](docs/metrics.md).
@@ -47,7 +48,7 @@ pnpm dev
 
 Open the URL printed by Vite with `?demo=1`, normally `http://127.0.0.1:5173/?demo=1`. Demo mode is deterministic, synthetic, clearly labelled, and does not contact a collector or require private data.
 
-To connect the collector, copy the environment template only after the demo works, keep the resulting file untracked, and configure one or two private Snapchain-compatible gRPC endpoints:
+To connect the collector, copy the environment template only after the demo works and keep the resulting file untracked. The template prefers private local gRPC endpoints and includes an identity-pinned public Hypersnap HTTPS fallback:
 
 ```powershell
 Copy-Item .env.example .env
@@ -56,18 +57,18 @@ Copy-Item .env.example .env
 ./scripts/run-collector.ps1 -EnvFile .env -Mode run
 ```
 
-The convenience endpoint defaults are `127.0.0.1:3383` for Snapchain and `127.0.0.1:4383` for Hypersnap. Upstream Hypersnap also listens on internal port `3383`; `4383` is only the documented host remap when both nodes share one machine.
+The convenience endpoint defaults are `127.0.0.1:3383` for Snapchain and `127.0.0.1:4383` for the preferred local Hypersnap node. Upstream Hypersnap also listens on internal port `3383`; `4383` is only the documented host remap when both nodes share one machine. The checked-in fallback points to the public node currently listed by the [official Hypersnap portal](https://hypersnap.org/). That listing proves neither node age nor historical uptime, and the exact peer/version pins deliberately fail closed when the operator changes the endpoint.
 
 The complete clean-room procedure, including local D1 migration, optional upstream-node checkouts, storage layout, validation, and the boundary around intentionally excluded private data, is in [Local reconstruction](docs/local-reconstruction.md).
 
 ## Architecture
 
 ```text
-Snapchain HubService ----+
-                         +--> Windows collector --> SQLite + durable outbox
-Hypersnap HubService ----+                              |
-                                                        | signed batches
-                                                        v
+Snapchain HubService -------------------+
+                                        +--> Windows collector --> SQLite + durable outbox
+Hypersnap local gRPC (preferred) -------+                              |
+Hypersnap HTTPS events (fallback only) -+                              | signed batches
+                                                                       v
 React/Vite assets <-- Cloudflare Worker API <-- D1 + hibernating Durable Object
         ^                                               |
         +---------------- WebSocket live fan-out --------+
@@ -84,6 +85,16 @@ SNAPCHAIN_GRPC_URL=127.0.0.1:3383
 HYPERSNAP_GRPC_URL=127.0.0.1:4383
 SNAPCHAIN_GRPC_TLS=false
 HYPERSNAP_GRPC_TLS=false
+HYPERSNAP_EXPECTED_PEER_ID=
+HYPERSNAP_EXPECTED_VERSION=
+HYPERSNAP_RPC_TIMEOUT_MS=5000
+HYPERSNAP_FALLBACK_HTTP_URL=https://haatz.quilibrium.com
+HYPERSNAP_FALLBACK_EXPECTED_PEER_ID=12D3KooWMYfkXiNcn9LifPkLYiHtGmXYnknYG1yFBD53rUseUMUc
+HYPERSNAP_FALLBACK_EXPECTED_VERSION=0.13.3
+HYPERSNAP_FAILOVER_AFTER_FAILURES=3
+HYPERSNAP_PREFERRED_RECOVERY_INTERVAL_MS=60000
+HYPERSNAP_PREFERRED_RECOVERY_SUCCESSES=3
+HYPERSNAP_MAX_BLOCK_DELAY_SECONDS=30
 SNAPCHAIN_GRPC_API_KEY=
 SNAPCHAIN_RPC_MIN_INTERVAL_MS=0
 SNAPMETER_INGEST_URL=
@@ -93,7 +104,9 @@ SNAPMETER_DATA_DIR=C:\ProgramData\SnapMeter
 
 After deployment, set `SNAPMETER_INGEST_URL` to the smoke-tested origin plus `/api/v1/ingest/batch` and set the secret locally to the value stored with Wrangler. Never commit either value.
 
-For a hosted Neynar Snapchain source, use `SNAPCHAIN_GRPC_URL=snapchain-grpc-api.neynar.com:443`, enable `SNAPCHAIN_GRPC_TLS=true`, place the Neynar credential in `SNAPCHAIN_GRPC_API_KEY`, and set `SNAPCHAIN_RPC_MIN_INTERVAL_MS=250` to pace shared two-shard replay below the Starter-plan request ceiling. Set `HYPERSNAP_SOURCE_MODE=unavailable` when no separate Hypersnap endpoint is connected. Keep the API key only in the ignored local environment file.
+For a hosted Neynar Snapchain source, use `SNAPCHAIN_GRPC_URL=snapchain-grpc-api.neynar.com:443`, enable `SNAPCHAIN_GRPC_TLS=true`, place the Neynar credential in `SNAPCHAIN_GRPC_API_KEY`, and set `SNAPCHAIN_RPC_MIN_INTERVAL_MS=250` to pace shared two-shard replay below the Starter-plan request ceiling. Set `HYPERSNAP_SOURCE_MODE=unavailable` when neither a local node nor an accepted HTTPS fallback is connected. Keep the API key only in the ignored local environment file.
+
+The public Hypersnap fallback exposes canonical HubEvents over HTTPS and is still `derived`; it does not expose an independently verified Hyper-write stream. A live retention probe during implementation reached only about three days, so it cannot supply an exact 30-day cold start. Keep the dashboard partial until prospective coverage reaches the full window. See [Data sources](docs/data-sources.md) for the trust, enrollment, and switching rules.
 
 ```powershell
 ./scripts/run-collector.ps1 -EnvFile .env -Mode doctor    # endpoints, shards, storage, clock, ingest auth, cursors, disk

@@ -24,6 +24,8 @@ Test-NetConnection 127.0.0.1 -Port 4383
 - Check loopback binding and firewall before changing software.
 - Do not automatically start a large node; verify storage/bandwidth/retention plans first.
 
+For the Hypersnap HTTPS fallback, do not use `Test-NetConnection 127.0.0.1`. Run `check-health.ps1` or `doctor`; they probe the configured `/v1/info` endpoint without printing credentials. The fallback URL must be absolute HTTPS with no embedded credentials, query, or fragment, and both expected peer ID and expected version are required.
+
 ## Doctor reports protocol or shard problems
 
 - A `shard_infos` entry for shard 0 is normal; it is block health, not an event subscription shard.
@@ -57,6 +59,20 @@ This can be correct. Idle sources have no fake beat, and replay/catch-up/reconci
 ## Hypersnap shows DERIVED or unavailable
 
 `DERIVED` is the expected honest mode at the pinned Hypersnap commit. Public RPC exposes canonical merges, not per-message Hyper outcomes. It cannot be changed by enabling `[hyper]` or observing `hyper:v1`. `unavailable` means the configured canonical source is disconnected or too stale/partial to support the inference.
+
+## Hypersnap fallback does not activate or return local
+
+Look for redacted `source.endpoint_rejected`, `source.endpoint_switching`, and `source.preferred_probe_failed` records, then run `doctor`. Common fail-closed causes are:
+
+- `/v1/info` peer ID or version no longer matches the exact environment pin;
+- peer/version/URL/shard set differs from the role's durable enrollment;
+- one or more positive data shards is absent, or block delay exceeds `HYPERSNAP_MAX_BLOCK_DELAY_SECONDS`;
+- `eventById` cannot return the current durable cursor because the public endpoint's roughly three-day retention has passed;
+- the cursor event's normalized fingerprint conflicts with the event already stored locally;
+- an upgraded/fresh database has a legacy cursor without a bound fingerprint, which a fallback is not allowed to adopt;
+- the preferred node has not yet passed `HYPERSNAP_PREFERRED_RECOVERY_SUCCESSES` consecutive probes at the configured interval.
+
+Do not fix these failures by clearing cursors, editing `source_endpoint_enrollment`, widening block delay without investigation, or changing the expected peer/version until the endpoint and upstream change have been reviewed. Stop the collector, back up the whole data directory, confirm the [official public-node listing](https://hypersnap.org/), inspect the current `/v1/info` response through `doctor`, and use a reviewed release/migration for intentional re-enrollment. If both roles are unusable, keep Hypersnap visibly unavailable.
 
 ## Cloud ingest rejects a batch
 

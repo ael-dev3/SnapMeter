@@ -20,8 +20,19 @@ export interface RecordedEvent {
   shard: number;
   eventId: string;
   eventType: string;
+  eventFingerprint: string;
   receivedAtMs: number;
   activity: ActivityRecord | null;
+}
+
+export interface SourceEndpointEnrollment {
+  source: Source;
+  role: "primary" | "fallback";
+  transport: "grpc" | "https-json";
+  canonicalUrl: string;
+  peerId: string;
+  version: string;
+  shardIds: number[];
 }
 
 export interface RecordEventResult {
@@ -61,7 +72,7 @@ export interface DatabaseStatus {
   lastCloudAckAtMs: number | null;
 }
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const ACTOR_PSEUDONYM_KEY_NAME = "actor_pseudonym_key_v1";
 const ACTOR_PSEUDONYM_KEY_BYTES = 32;
 const ACTOR_PSEUDONYM_DOMAIN = "snapmeter-actor-day-v2\0";
@@ -112,13 +123,28 @@ export class CollectorDatabase {
 
   recordEvent(event: RecordedEvent): RecordEventResult {
     assertEventId(event.eventId);
+    assertFingerprint(event.eventFingerprint);
     if (!Number.isSafeInteger(event.shard) || event.shard < 0) throw new Error("invalid shard index");
     return this.#transaction(() => {
-      const inserted = changes(this.#prepare(`
-        INSERT OR IGNORE INTO event_dedupe(source, shard, event_id, event_type, received_at_ms)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(event.source, event.shard, event.eventId, event.eventType, event.receivedAtMs)) > 0;
-      if (!inserted) return { duplicate: true, actionInserted: false };
+      const existingEvent = this.#prepare(`
+        SELECT event_fingerprint FROM event_dedupe WHERE source = ? AND shard = ? AND event_id = ?
+      `).get(event.source, event.shard, event.eventId) as { event_fingerprint?: unknown } | undefined;
+      if (existingEvent) {
+        const fingerprint = typeof existingEvent.event_fingerprint === "string" ? existingEvent.event_fingerprint : "";
+        if (fingerprint && fingerprint !== event.eventFingerprint) {
+          throw new Error("event fingerprint conflict for an existing source/shard/id");
+        }
+        if (!fingerprint) {
+          this.#prepare(`
+            UPDATE event_dedupe SET event_fingerprint = ? WHERE source = ? AND shard = ? AND event_id = ?
+          `).run(event.eventFingerprint, event.source, event.shard, event.eventId);
+        }
+        return { duplicate: true, actionInserted: false };
+      }
+      this.#prepare(`
+        INSERT INTO event_dedupe(source, shard, event_id, event_type, event_fingerprint, received_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(event.source, event.shard, event.eventId, event.eventType, event.eventFingerprint, event.receivedAtMs);
       if (!event.activity) return { duplicate: false, actionInserted: false };
 
       const action = event.activity;
@@ -219,6 +245,64 @@ export class CollectorDatabase {
     return Boolean(this.#prepare(`
       SELECT 1 AS present FROM event_dedupe WHERE source = ? AND shard = ? AND event_id = ?
     `).get(source, shard, eventId));
+  }
+
+  eventFingerprint(source: Source, shard: number, eventId: string): string | null {
+    assertEventId(eventId);
+    const row = this.#prepare(`
+      SELECT event_fingerprint FROM event_dedupe WHERE source = ? AND shard = ? AND event_id = ?
+    `).get(source, shard, eventId) as { event_fingerprint?: unknown } | undefined;
+    const value = typeof row?.event_fingerprint === "string" ? row.event_fingerprint : "";
+    return /^[0-9a-f]{64}$/.test(value) ? value : null;
+  }
+
+  validateOrEnrollSourceEndpoint(enrollment: SourceEndpointEnrollment, nowMs: number): void {
+    const normalized = normalizeEndpointEnrollment(enrollment);
+    this.#transaction(() => {
+      const row = this.#sourceEndpointEnrollmentRow(normalized.source, normalized.role);
+      if (!row) {
+        this.#prepare(`
+          INSERT INTO source_endpoint_enrollment(
+            source, role, transport, canonical_url, peer_id, version, shard_ids_json, enrolled_at_ms, last_verified_at_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          normalized.source,
+          normalized.role,
+          normalized.transport,
+          normalized.canonicalUrl,
+          normalized.peerId,
+          normalized.version,
+          normalized.shardsJson,
+          nowMs,
+          nowMs
+        );
+        return;
+      }
+      assertEndpointEnrollmentMatches(row, normalized);
+      this.#prepare(`
+        UPDATE source_endpoint_enrollment SET last_verified_at_ms = ? WHERE source = ? AND role = ?
+      `).run(nowMs, normalized.source, normalized.role);
+    });
+  }
+
+  /**
+   * Read-only enrollment check used by doctor. An unenrolled endpoint is
+   * allowed because the runtime will atomically enroll it before activation;
+   * any change to an existing enrollment fails closed.
+   */
+  checkSourceEndpointEnrollment(enrollment: SourceEndpointEnrollment): "unenrolled" | "match" {
+    const normalized = normalizeEndpointEnrollment(enrollment);
+    const row = this.#sourceEndpointEnrollmentRow(normalized.source, normalized.role);
+    if (!row) return "unenrolled";
+    assertEndpointEnrollmentMatches(row, normalized);
+    return "match";
+  }
+
+  setActiveSourceEndpoint(source: Source, role: "primary" | "fallback", nowMs: number): void {
+    this.#prepare(`
+      INSERT INTO active_source_endpoint(source, role, switched_at_ms) VALUES (?, ?, ?)
+      ON CONFLICT(source) DO UPDATE SET role = excluded.role, switched_at_ms = excluded.switched_at_ms
+    `).run(source, role, nowMs);
   }
 
   loadActions(source: Source, sinceExclusiveMs: number): ActivityRecord[] {
@@ -511,6 +595,13 @@ export class CollectorDatabase {
     return this.#database.prepare(sql);
   }
 
+  #sourceEndpointEnrollmentRow(source: Source, role: "primary" | "fallback"): SqlRow | undefined {
+    return this.#prepare(`
+      SELECT transport, canonical_url, peer_id, version, shard_ids_json
+      FROM source_endpoint_enrollment WHERE source = ? AND role = ?
+    `).get(source, role) as SqlRow | undefined;
+  }
+
   #transaction<T>(operation: () => T): T {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -532,25 +623,39 @@ export class CollectorDatabase {
     `);
     const current = numberColumn(this.#prepare("SELECT COALESCE(MAX(version), 0) AS value FROM schema_migrations").get(), "value");
     if (current > SCHEMA_VERSION) throw new Error(`database schema ${current} is newer than collector schema ${SCHEMA_VERSION}`);
-    if (current < 1) {
+    const applied = new Set((this.#prepare("SELECT version FROM schema_migrations").all() as Array<{ version: number }>).map((row) => Number(row.version)));
+    if (!applied.has(1)) {
       this.#transaction(() => {
         this.#database.exec(MIGRATION_1);
         this.#prepare("INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, ?)").run(Date.now());
       });
     }
-    if (current < 2) {
+    if (!applied.has(2)) {
       this.#transaction(() => {
         this.#database.exec(MIGRATION_2);
         this.#prepare("INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, ?)").run(Date.now());
       });
     }
-    if (current < 3) {
+    if (!applied.has(3)) {
       this.#transaction(() => {
         this.#database.exec(MIGRATION_3);
         this.#prepare("INSERT INTO collector_secrets(name, value) VALUES (?, ?)")
           .run(ACTOR_PSEUDONYM_KEY_NAME, randomBytes(ACTOR_PSEUDONYM_KEY_BYTES));
         this.#loadActorPseudonymKey();
         this.#prepare("INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, ?)").run(Date.now());
+      });
+    }
+    if (!applied.has(4)) {
+      this.#transaction(() => {
+        const columns = this.#prepare("PRAGMA table_info(event_dedupe)").all() as Array<{ name?: unknown }>;
+        if (!columns.some((column) => column.name === "event_fingerprint")) {
+          this.#database.exec(`
+            ALTER TABLE event_dedupe ADD COLUMN event_fingerprint TEXT NOT NULL DEFAULT ''
+              CHECK (event_fingerprint = '' OR (length(event_fingerprint) = 64 AND event_fingerprint NOT GLOB '*[^0-9a-f]*'))
+          `);
+        }
+        this.#database.exec(MIGRATION_4);
+        this.#prepare("INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, ?)").run(Date.now());
       });
     }
   }
@@ -571,6 +676,48 @@ export function maxEventId(...ids: readonly string[]): string {
 
 function assertEventId(eventId: string): void {
   if (!/^\d+$/.test(eventId)) throw new Error(`invalid event id: ${eventId}`);
+}
+
+function assertFingerprint(value: string): void {
+  if (!/^[0-9a-f]{64}$/.test(value)) throw new Error("event fingerprint must be a lowercase SHA-256 value");
+}
+
+interface NormalizedSourceEndpointEnrollment extends Omit<SourceEndpointEnrollment, "shardIds"> {
+  shardsJson: string;
+}
+
+function normalizeEndpointEnrollment(enrollment: SourceEndpointEnrollment): NormalizedSourceEndpointEnrollment {
+  if (!enrollment.peerId || enrollment.peerId.length > 256 || hasControlCharacters(enrollment.peerId)) {
+    throw new Error("endpoint enrollment peer identity is invalid");
+  }
+  if (!enrollment.version || enrollment.version.length > 128 || hasControlCharacters(enrollment.version)) {
+    throw new Error("endpoint enrollment version is invalid");
+  }
+  if (!enrollment.canonicalUrl || enrollment.canonicalUrl.length > 2_048 || hasControlCharacters(enrollment.canonicalUrl)) {
+    throw new Error("endpoint enrollment canonical URL is invalid");
+  }
+  const shardIds = [...new Set(enrollment.shardIds)].sort((left, right) => left - right);
+  if (shardIds.length === 0 || shardIds.some((shard) => !Number.isSafeInteger(shard) || shard <= 0)) {
+    throw new Error("endpoint enrollment requires positive data shards");
+  }
+  return { ...enrollment, shardsJson: JSON.stringify(shardIds) };
+}
+
+function assertEndpointEnrollmentMatches(row: SqlRow, enrollment: NormalizedSourceEndpointEnrollment): void {
+  const matches = row.transport === enrollment.transport
+    && row.canonical_url === enrollment.canonicalUrl
+    && row.peer_id === enrollment.peerId
+    && row.version === enrollment.version
+    && row.shard_ids_json === enrollment.shardsJson;
+  if (!matches) throw new Error("endpoint identity changed from its durable enrollment");
+}
+
+function hasControlCharacters(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || code === 127) return true;
+  }
+  return false;
 }
 
 function changes(result: { changes: number | bigint }): number {
@@ -723,5 +870,26 @@ const MIGRATION_3 = `
   CREATE TABLE collector_secrets (
     name TEXT PRIMARY KEY CHECK (name IN ('actor_pseudonym_key_v1')),
     value BLOB NOT NULL CHECK (typeof(value) = 'blob' AND length(value) = 32)
+  ) STRICT;
+`;
+
+const MIGRATION_4 = `
+  CREATE TABLE IF NOT EXISTS source_endpoint_enrollment (
+    source TEXT NOT NULL CHECK (source IN ('snapchain', 'hypersnap')),
+    role TEXT NOT NULL CHECK (role IN ('primary', 'fallback')),
+    transport TEXT NOT NULL CHECK (transport IN ('grpc', 'https-json')),
+    canonical_url TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    shard_ids_json TEXT NOT NULL,
+    enrolled_at_ms INTEGER NOT NULL,
+    last_verified_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, role)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS active_source_endpoint (
+    source TEXT PRIMARY KEY CHECK (source IN ('snapchain', 'hypersnap')),
+    role TEXT NOT NULL CHECK (role IN ('primary', 'fallback')),
+    switched_at_ms INTEGER NOT NULL
   ) STRICT;
 `;

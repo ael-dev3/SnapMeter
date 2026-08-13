@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { HYPERSNAP_CLASSIFIER_VERSION, MESSAGE_TYPES, actionFamilyForMessage, isHyperEligible, isSnapchainQualifying } from "./classifier";
+import { HYPERSNAP_CLASSIFIER_VERSION, HYPERSNAP_PUBLIC_COMPAT_SHA, MESSAGE_TYPES, actionFamilyForMessage, isHyperEligible, isSnapchainQualifying } from "./classifier";
 import { FARCASTER_EPOCH_MS, normalizeMergeEvent } from "./rpc";
 
 describe("Hyper eligibility classifier", () => {
   it("is versioned to the inspected Hypersnap source", () => {
     expect(HYPERSNAP_CLASSIFIER_VERSION).toMatch(/^2eee4c9f2a78/);
+    expect(HYPERSNAP_PUBLIC_COMPAT_SHA).toBe("ce408646fd09d886f275b74757341a1d328728ab");
   });
 
   it.each([
@@ -41,7 +42,7 @@ describe("canonical event normalization", () => {
     id: "99",
     shardIndex: 2,
     timestamp: "100",
-    mergeMessageBody: { message: { data: { type: "MESSAGE_TYPE_CAST_ADD", fid: "42", timestamp: "90" } } }
+    mergeMessageBody: { message: { data: { type: "MESSAGE_TYPE_CAST_ADD", fid: "42", timestamp: "90", network: "FARCASTER_NETWORK_MAINNET" } } }
   };
 
   it("uses confirmed HubEvent time ahead of message time", () => {
@@ -53,7 +54,9 @@ describe("canonical event normalization", () => {
 
   it("derives only eligible Hypersnap observations", () => {
     expect(normalizeMergeEvent(base, "hypersnap", "derived", FARCASTER_EPOCH_MS + 101_000, false)).not.toBeNull();
-    expect(normalizeMergeEvent({ ...base, mergeMessageBody: { message: { data: { type: MESSAGE_TYPES.KEY_ADD, fid: "42", timestamp: "90" } } } }, "hypersnap", "derived", FARCASTER_EPOCH_MS + 101_000, false)).toBeNull();
+    expect(normalizeMergeEvent({ ...base, mergeMessageBody: { message: { data: { type: MESSAGE_TYPES.KEY_ADD, fid: "42", timestamp: "90", network: 1 } } } }, "hypersnap", "derived", FARCASTER_EPOCH_MS + 101_000, false)).toBeNull();
+    expect(normalizeMergeEvent({ ...base, mergeMessageBody: { message: { data: { type: 1, fid: "42", timestamp: "90", network: 2 } } } }, "hypersnap", "derived", FARCASTER_EPOCH_MS + 101_000, false)).toBeNull();
+    expect(normalizeMergeEvent({ ...base, mergeMessageBody: { message: { data: { type: 1, fid: "42", timestamp: "90" } } } }, "hypersnap", "derived", FARCASTER_EPOCH_MS + 101_000, false)).toBeNull();
   });
 
   it("rejects failures, maintenance, and missing FIDs", () => {
