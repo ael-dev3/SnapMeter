@@ -105,6 +105,55 @@ test.describe("mobile portrait overview", () => {
     await expect(page.getByTestId("panel-snapchain")).toContainText("58,429");
     await context.setOffline(false);
   });
+
+  test("keeps every explanatory tooltip inside the visual viewport", async ({ browser }) => {
+    const viewports = [
+      { width: 320, height: 568, safe: { bottom: 18, left: 28, right: 24, top: 20 } },
+      { width: 360, height: 844, safe: { bottom: 12, left: 12, right: 12, top: 12 } },
+      { width: 390, height: 844, safe: { bottom: 12, left: 12, right: 12, top: 12 } },
+      { width: 430, height: 844, safe: { bottom: 12, left: 12, right: 12, top: 12 } }
+    ];
+    for (const { width, height, safe } of viewports) {
+      const context = await browser.newContext({ viewport: { width, height } });
+      const page = await context.newPage();
+      await page.goto("/?demo=1");
+      const triggers = page.locator(".info-trigger");
+      await expect(triggers).toHaveCount(4);
+
+      for (let index = 0; index < 4; index += 1) {
+        const trigger = triggers.nth(index);
+        await trigger.click();
+        if (index === 0) {
+          await page.evaluate((insets) => {
+            for (const [side, value] of Object.entries(insets)) {
+              document.documentElement.style.setProperty(`--fc-safe-area-inset-${side}`, `${value}px`);
+            }
+          }, safe);
+        }
+        const tooltipId = await trigger.getAttribute("aria-describedby");
+        expect(tooltipId).not.toBeNull();
+        const tooltip = page.locator(`[id="${tooltipId}"]`);
+        await expect(tooltip).toBeVisible();
+        const bounds = await tooltip.boundingBox();
+        const viewport = await page.evaluate(() => ({
+          height: window.visualViewport?.height ?? window.innerHeight,
+          left: window.visualViewport?.offsetLeft ?? 0,
+          top: window.visualViewport?.offsetTop ?? 0,
+          width: window.visualViewport?.width ?? window.innerWidth
+        }));
+        expect(bounds).not.toBeNull();
+        expect(bounds!.x).toBeGreaterThanOrEqual(viewport.left + safe.left - 1);
+        expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.left + viewport.width - safe.right + 1);
+        expect(bounds!.y).toBeGreaterThanOrEqual(viewport.top + safe.top - 1);
+        expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.top + viewport.height - safe.bottom + 1);
+        expect(await tooltip.evaluate((element) => element.parentElement === document.body)).toBe(true);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+        await page.keyboard.press("Escape");
+        await expect(trigger).not.toHaveAttribute("aria-describedby", /.+/);
+      }
+      await context.close();
+    }
+  });
 });
 
 test("switches to side-by-side protocol comparison on desktop", async ({ page }) => {
