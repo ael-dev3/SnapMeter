@@ -1,16 +1,18 @@
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
 
 describe("collector configuration", () => {
-  it("uses Windows-local defaults and allows endpoint TLS/auth overrides", () => {
+  it("uses the platform-local app-data root and allows endpoint TLS/auth overrides", () => {
+    const localAppData = resolve("test-local-app-data");
     const config = loadConfig({
-      LOCALAPPDATA: "C:\\Local",
+      LOCALAPPDATA: localAppData,
       SNAPCHAIN_GRPC_URL: "snap.example:443",
       SNAPCHAIN_GRPC_TLS: "true",
       SNAPCHAIN_GRPC_AUTHORIZATION: "Bearer private",
       HYPERSNAP_GRPC_URL: "[::1]:4383"
     });
-    expect(config.dataDir).toBe("C:\\Local\\SnapMeter");
+    expect(config.dataDir).toBe(join(localAppData, "SnapMeter"));
     expect(config.endpoints.snapchain).toMatchObject({
       url: "snap.example:443",
       tls: true,
