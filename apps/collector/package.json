@@ -1,0 +1,21 @@
+{
+  "name": "@snapmeter/collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "snapmeter-collector": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "collector": "tsx src/cli.ts",
+    "start": "tsx src/cli.ts run",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@snapmeter/contracts": "workspace:*",
+    "@snapmeter/metrics": "workspace:*",
+    "@snapmeter/protocol": "workspace:*"
+  }
+}
