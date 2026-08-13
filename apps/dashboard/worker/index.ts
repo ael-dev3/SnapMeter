@@ -5,13 +5,15 @@ import {
   verifyIngestSignature,
   type IngestBatch
 } from "@snapmeter/contracts";
+import { handleFarcasterMe } from "./farcaster-auth";
 import { LiveRoom } from "./live-room";
-import { checkRateLimit, knownIngestBatch, latestStatus, markLiveDeliveryPublished, pendingLiveDeliveries, persistBatch, readSummary, refundRateLimit, releaseLiveDeliveryLease } from "./repository";
+import { checkRateLimit, claimCollectorBinding, collectorBindingAllows, knownIngestBatch, latestStatus, markLiveDeliveryPublished, pendingLiveDeliveries, persistBatch, readSummary, refundRateLimit, releaseLiveDeliveryLease } from "./repository";
 import type { Env, ExecutionContextLike, ScheduledControllerLike } from "./types";
 
 export { LiveRoom };
 
 const MAX_BODY_BYTES = 512 * 1024;
+const MAX_FUTURE_RECORD_SKEW_MS = 60_000;
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -32,6 +34,7 @@ export async function handleRequest(request: Request, env: Env, _ctx?: Execution
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/api/")) return new Response("Not found", { status: 404 });
   if (url.pathname === "/api/v1/ingest/batch" && request.method === "POST") return handleIngest(request, env);
+  if (url.pathname === "/api/v1/farcaster/me" && request.method === "GET") return handleFarcasterMe(request);
   if (url.pathname === "/api/v1/summary" && request.method === "GET") return json(await readSummary(env));
   if (url.pathname === "/api/v1/status" && request.method === "GET") {
     const summary = await readSummary(env);
@@ -137,8 +140,8 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   if (mediaType !== "application/json") return json({ error: "unsupported_content_type" }, {}, 415);
   const declaredLength = Number(request.headers.get("content-length") ?? "0");
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return json({ error: "payload_too_large" }, {}, 413);
-  const rawBody = await request.text();
-  if (new TextEncoder().encode(rawBody).byteLength > MAX_BODY_BYTES) return json({ error: "payload_too_large" }, {}, 413);
+  const rawBody = await readBodyLimited(request, MAX_BODY_BYTES);
+  if (rawBody === null) return json({ error: "payload_too_large" }, {}, 413);
   const timestamp = request.headers.get("x-snapmeter-timestamp") ?? "";
   const nonce = request.headers.get("x-snapmeter-nonce") ?? "";
   const signature = request.headers.get("x-snapmeter-signature") ?? "";
@@ -152,18 +155,26 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   if (!parsed.success) return json({ error: "invalid_batch", issues: parsed.error.issues.map((issue) => ({ path: issue.path.join("."), code: issue.code })) }, {}, 400);
   const batch = parsed.data;
   if (batch.batchId.toLowerCase() !== nonce.toLowerCase()) return json({ error: "nonce_batch_mismatch" }, {}, 401);
+  const receivedAtMs = Date.now();
+  const timeError = validateBatchTimes(batch, Number(timestamp), receivedAtMs);
+  if (timeError !== null) return json({ error: "invalid_batch_time", field: timeError }, {}, 400);
   const recordCount = batch.actorDays.length + batch.minuteBuckets.length + batch.cursors.length + batch.health.length + batch.snapshots.length + batch.comparisonSnapshots.length;
   if (recordCount > 700) return json({ error: "too_many_records", max: 700 }, {}, 413);
   if (request.headers.get("x-snapmeter-doctor") === "1") {
     if (!isEmptyProbe(batch)) return json({ error: "doctor_probe_must_be_empty" }, {}, 400);
+    if (!(await collectorBindingAllows(env, batch.collectorId))) {
+      return json({ error: "collector_identity_conflict" }, {}, 409);
+    }
     return json({ ok: true, authenticated: true, serverTimeMs: Date.now() });
+  }
+  if (!(await claimCollectorBinding(env, batch.collectorId, receivedAtMs))) {
+    return json({ error: "collector_identity_conflict" }, {}, 409);
   }
   const known = await knownIngestBatch(env, batch.batchId);
   if (known) {
     await drainLiveDeliveryOutbox(env);
     return json({ ok: true, batchId: batch.batchId, duplicate: true, acceptedAtMs: known.receivedAtMs });
   }
-  const receivedAtMs = Date.now();
   if (!(await checkRateLimit(env, batch, receivedAtMs))) {
     const becameKnown = await knownIngestBatch(env, batch.batchId);
     if (becameKnown) {
@@ -177,7 +188,7 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   catch (error) {
     await refundRateLimit(env, batch, receivedAtMs);
     if (error instanceof RangeError) return json({ error: error.message }, {}, 413);
-    console.error(JSON.stringify({ level: "error", event: "ingest_failed", batchId: batch.batchId, error: error instanceof Error ? error.message : String(error) }));
+    console.error(JSON.stringify({ level: "error", event: "ingest_failed", batchId: batch.batchId, errorKind: safeErrorKind(error) }));
     return json({ error: "ingest_failed" }, {}, 500);
   }
   if (disposition === "duplicate") {
@@ -188,10 +199,85 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   }
   try { await drainLiveDeliveryOutbox(env); }
   catch (error) {
-    console.error(JSON.stringify({ level: "error", event: "live_delivery_deferred", batchId: batch.batchId, error: error instanceof Error ? error.message : String(error) }));
+    console.error(JSON.stringify({ level: "error", event: "live_delivery_deferred", batchId: batch.batchId, errorKind: safeErrorKind(error) }));
     return json({ error: "live_delivery_deferred" }, { "retry-after": "1" }, 503);
   }
   return json({ ok: true, batchId: batch.batchId, duplicate: false, acceptedAtMs: receivedAtMs }, {}, 202);
+}
+
+async function readBodyLimited(request: Request, maximumBytes: number): Promise<string | null> {
+  if (request.body === null) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maximumBytes) {
+        try { await reader.cancel(); } catch { /* the size rejection still wins if upstream cancellation fails */ }
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function validateBatchTimes(batch: IngestBatch, signedAtMs: number, receivedAtMs: number): string | null {
+  // The body can be retried long after it was created, so old sentAtMs values
+  // remain valid. Only reject a body whose claimed creation time is ahead of
+  // the already-fresh signed request/server clocks.
+  const requestFutureLimit = Math.max(receivedAtMs, signedAtMs) + MAX_FUTURE_RECORD_SKEW_MS;
+  if (batch.sentAtMs > requestFutureLimit) return "sentAtMs";
+  const recordFutureLimit = batch.sentAtMs + MAX_FUTURE_RECORD_SKEW_MS;
+  const future = (value: number): boolean => value > recordFutureLimit;
+
+  for (const pulse of batch.pulses) {
+    if (pulse.windowStartMs > pulse.windowEndMs) return "pulses.window";
+    if (pulse.lastActionAtMs > pulse.windowEndMs) return "pulses.lastActionAtMs";
+    if (future(pulse.windowStartMs) || future(pulse.windowEndMs) || future(pulse.lastActionAtMs)) return "pulses.future";
+  }
+  if (batch.snapshots.length > 0 && batch.snapshots.some((snapshot) => snapshot.updatedAtMs !== batch.sentAtMs)) {
+    return "snapshots.updatedAtMs";
+  }
+  for (const snapshot of batch.snapshots) {
+    if (future(snapshot.updatedAtMs)) return "snapshots.updatedAtMs";
+    if (snapshot.lastActionAtMs !== null && (snapshot.lastActionAtMs > snapshot.updatedAtMs || future(snapshot.lastActionAtMs))) {
+      return "snapshots.lastActionAtMs";
+    }
+    if (snapshot.lastCollectorAtMs !== null && future(snapshot.lastCollectorAtMs)) return "snapshots.lastCollectorAtMs";
+  }
+  for (const comparison of batch.comparisonSnapshots) {
+    if (comparison.generatedAtMs !== batch.sentAtMs) return "comparisonSnapshots.generatedAtMs";
+    if (future(comparison.generatedAtMs)) return "comparisonSnapshots.generatedAtMs";
+  }
+  for (const bucket of batch.minuteBuckets) {
+    if (future(bucket.minuteStartMs)) return "minuteBuckets.minuteStartMs";
+  }
+  for (const cursor of batch.cursors) {
+    if (future(cursor.verifiedAtMs)) return "cursors.verifiedAtMs";
+  }
+  for (const health of batch.health) {
+    if (future(health.observedAtMs)) return "health.observedAtMs";
+    if (health.node.historyCoverageStartMs !== null && future(health.node.historyCoverageStartMs)) {
+      return "health.node.historyCoverageStartMs";
+    }
+  }
+  for (const actor of batch.actorDays) {
+    if (actor.day > new Date(recordFutureLimit).toISOString().slice(0, 10)) return "actorDays.day";
+  }
+  return null;
 }
 
 async function drainLiveDeliveryOutbox(env: Env): Promise<void> {
@@ -287,4 +373,8 @@ function isEmptyProbe(batch: IngestBatch): boolean {
 
 function json(body: unknown, headers: Record<string, string> = {}, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...headers } });
+}
+
+function safeErrorKind(error: unknown): "error" | "unknown" {
+  return error instanceof Error ? "error" : "unknown";
 }

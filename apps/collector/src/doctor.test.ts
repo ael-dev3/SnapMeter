@@ -69,7 +69,7 @@ function fakeRpc(): CollectorRpc {
     }),
     getEvent: async () => ({ id: "10" }),
     getEvents: async () => ({ events: [] }),
-    subscribe: () => ({ cancel() {}, done: Promise.resolve() }),
+    subscribe: () => ({ cancel() {}, ready: Promise.resolve(), done: Promise.resolve() }),
     close() {}
   };
 }

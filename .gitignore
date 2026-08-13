@@ -9,6 +9,15 @@ coverage/
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
 playwright-report/
 test-results/

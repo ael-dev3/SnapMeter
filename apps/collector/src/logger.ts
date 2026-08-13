@@ -15,7 +15,7 @@ export interface LoggerOptions {
 }
 
 const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
-const SENSITIVE_KEY = /(?:authorization|cookie|password|secret|signature|token)/i;
+const SENSITIVE_KEY = /(?:api[_-]?key|authorization|cookie|hash[_-]?key|password|pseudonym(?:[_-]?key)?|secret|signature|token)/i;
 
 export function createLogger(options: LoggerOptions = {}): Logger {
   const write = options.write ?? ((line: string) => process.stdout.write(`${line}\n`));
@@ -48,6 +48,17 @@ export function redact(value: unknown, secrets: readonly string[] = [], key = ""
     return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, redact(child, secrets, childKey)]));
   }
   return value;
+}
+
+export function sensitiveEnvironmentValues(environment: Record<string, string | undefined>): string[] {
+  const values = new Set<string>();
+  for (const [key, value] of Object.entries(environment)) {
+    if (!SENSITIVE_KEY.test(key) || !value) continue;
+    values.add(value);
+    const trimmed = value.trim();
+    if (trimmed) values.add(trimmed);
+  }
+  return [...values];
 }
 
 function scrub(value: string, secrets: readonly string[]): string {

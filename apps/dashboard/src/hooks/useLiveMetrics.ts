@@ -7,12 +7,12 @@ export type TransportState = "loading" | "connecting" | "live" | "reconnecting" 
 export interface PulseState {
   id: number;
   count: number;
-  observedAtMs: number | null;
+  lastActionAtMs: number | null;
 }
 
 const EMPTY_PULSE: Record<Source, PulseState> = {
-  snapchain: { id: 0, count: 0, observedAtMs: null },
-  hypersnap: { id: 0, count: 0, observedAtMs: null }
+  snapchain: { id: 0, count: 0, lastActionAtMs: null },
+  hypersnap: { id: 0, count: 0, lastActionAtMs: null }
 };
 
 export function applyClientFreshness(summary: Summary, nowMs: number): Summary {
@@ -176,7 +176,7 @@ export function useLiveMetrics(): {
             [envelope.data.source]: {
               id: current[envelope.data.source].id + 1,
               count: envelope.data.eventCount,
-              observedAtMs: envelope.data.windowEndMs
+              lastActionAtMs: envelope.data.lastActionAtMs
             }
           }));
         } else if (envelope.type === "status") {
@@ -188,7 +188,6 @@ export function useLiveMetrics(): {
                 ...current.sources[envelope.data.source],
                 sourceMode: envelope.data.sourceMode,
                 status: envelope.data.status,
-                updatedAtMs: envelope.data.observedAtMs,
                 node: envelope.data.node,
                 caveat: envelope.data.message
               }

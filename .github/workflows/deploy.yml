@@ -27,6 +27,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm security:check
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm lint
       - run: pnpm typecheck
@@ -67,6 +68,10 @@ jobs:
       - name: Install locked dependencies
         if: env.CLOUDFLARE_READY == 'true'
         run: pnpm install --frozen-lockfile
+
+      - name: Verify signed Mini App release metadata
+        if: env.CLOUDFLARE_READY == 'true'
+        run: pnpm --filter @snapmeter/dashboard verify:miniapp:release
 
       - name: Apply production D1 migrations
         if: env.CLOUDFLARE_READY == 'true'

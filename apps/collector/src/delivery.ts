@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   IngestBatchSchema,
   IngestResponseSchema,
@@ -156,7 +156,7 @@ export function enqueueIngestBatch(
   const collectorId = database.collectorId;
   const actorDays = actorRows.map(({ value, fid }) => ({
     ...value,
-    fidHash: hashFid(config.ingestSecret as string, fid)
+    fidHash: database.actorDayPseudonym(value.source, value.day, fid)
   }));
   const batch: IngestBatch = {
     schemaVersion: SCHEMA_VERSION,
@@ -207,11 +207,6 @@ export function buildComparisonSnapshot(
       ? "The exact rolling-24h active-FID sets are identical; the sources may observe overlapping canonical traffic."
       : "Exact rolling-24h set overlap is calculated locally; differences may reflect Hyper eligibility, node health, lag, or shard coverage."
   };
-}
-
-export function hashFid(secret: string, fid: string): string {
-  if (!secret) throw new Error("actor-day hashing requires the ingest secret");
-  return createHmac("sha256", secret).update("snapmeter-actor-day-v1\0").update(fid).digest("hex");
 }
 
 const ACTION_FAMILIES: readonly ActionFamily[] = [
@@ -272,8 +267,11 @@ export class OutboxDispatcher {
             body: row.payloadJson,
             signal: AbortSignal.timeout(15_000)
           });
-          const body = await response.text();
-          if (!response.ok) throw new Error(`ingest returned HTTP ${response.status}: ${body.slice(0, 200)}`);
+          if (!response.ok) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new Error(`ingest returned HTTP ${response.status}`);
+          }
+          const body = await boundedResponseText(response);
           const parsed = IngestResponseSchema.parse(JSON.parse(body));
           if (parsed.batchId !== row.batchId) throw new Error("ingest acknowledgement batch id did not match");
           this.database.acknowledgeOutbox(row.id, row.batchId, parsed.acceptedAtMs);
@@ -295,6 +293,39 @@ export class OutboxDispatcher {
     } finally {
       this.#draining = false;
     }
+  }
+}
+
+async function boundedResponseText(response: Response, maximumBytes = 16 * 1024): Promise<string> {
+  const advertised = response.headers.get("content-length");
+  if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > maximumBytes)) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error("ingest response was too large");
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    total += result.value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error("ingest response was too large");
+    }
+    chunks.push(result.value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("ingest response was not valid UTF-8");
   }
 }
 

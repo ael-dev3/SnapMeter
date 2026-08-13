@@ -4,8 +4,8 @@ Start with a redacted diagnostic snapshot:
 
 ```powershell
 ./scripts/check-health.ps1 -EnvFile .env
-pnpm collector doctor
-pnpm collector status
+./scripts/run-collector.ps1 -EnvFile .env -Mode doctor
+./scripts/run-collector.ps1 -EnvFile .env -Mode status
 ```
 
 Do not paste `.env`, signatures, authorization headers, raw ingest bodies, or database files into an issue.
@@ -67,6 +67,7 @@ This can be correct. Idle sources have no fake beat, and replay/catch-up/reconci
 - Check schema version and request size.
 - Verify the D1 replay/idempotency migration and `DB` binding.
 - A temporary Worker failure should leave the batch in the durable local outbox.
+- HTTP 409 `collector_identity_conflict` means D1 is already bound to another collector ID. Stop the new process and restore the complete registered collector database state. Do not weaken the check or delete its outbox. Moving intentionally to a fresh database requires the documented manual collector-binding reset and actor-day continuity plan.
 
 ## Site loads but status is stale/disconnected
 

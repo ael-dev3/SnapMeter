@@ -9,6 +9,7 @@ import type { Env } from "./types";
 import { checkRateLimit, SOURCE_RATE_SCOPE } from "./repository";
 
 const SECRET = "worker-test-secret-with-32-characters";
+const MAX_INGEST_BODY_BYTES = 512 * 1024;
 
 function batch(batchId = crypto.randomUUID(), pulse = false): IngestBatch {
   const now = Date.now();
@@ -28,7 +29,7 @@ function batch(batchId = crypto.randomUUID(), pulse = false): IngestBatch {
       uniqueFids: 2,
       actionCounts: { cast: 2, reaction: 1 },
       lastActionAtMs: now,
-      maxEventId: "1:49153",
+      maxEventId: "49153",
       isReplay: false
     }] : [],
     snapshots: [],
@@ -42,35 +43,81 @@ function batch(batchId = crypto.randomUUID(), pulse = false): IngestBatch {
 
 async function signedRequest(payload: ReturnType<typeof batch>, extraHeaders: Record<string, string> = {}): Promise<Request> {
   const raw = JSON.stringify(payload);
+  return signedRawRequest(raw, payload.batchId, raw, extraHeaders);
+}
+
+async function signedRawRequest(
+  raw: string,
+  batchId: string,
+  body: BodyInit,
+  extraHeaders: Record<string, string> = {}
+): Promise<Request> {
   const timestamp = String(Date.now());
   return new Request("https://snapmeter.test/api/v1/ingest/batch", {
     method: "POST",
     headers: {
       "content-type": "application/json",
       "x-snapmeter-timestamp": timestamp,
-      "x-snapmeter-nonce": payload.batchId,
-      "x-snapmeter-signature": await signIngest(SECRET, timestamp, payload.batchId, raw),
+      "x-snapmeter-nonce": batchId,
+      "x-snapmeter-signature": await signIngest(SECRET, timestamp, batchId, raw),
       ...extraHeaders
     },
-    body: raw
+    body
   });
 }
 
-function nextMessage(socket: WebSocket): Promise<string> {
+function paddedBatch(payload: ReturnType<typeof batch>, targetBytes: number): string {
+  const empty = JSON.stringify({ ...payload, _padding: "" });
+  const paddingBytes = targetBytes - new TextEncoder().encode(empty).byteLength;
+  if (paddingBytes < 0) throw new RangeError("target body is smaller than the base batch");
+  const raw = JSON.stringify({ ...payload, _padding: "x".repeat(paddingBytes) });
+  if (new TextEncoder().encode(raw).byteLength !== targetBytes) throw new Error("failed to construct exact-size ingest body");
+  return raw;
+}
+
+function chunkedBody(raw: string, chunkBytes = 64 * 1024): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(raw);
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + chunkBytes, bytes.byteLength);
+      controller.enqueue(bytes.slice(offset, end));
+      offset = end;
+    }
+  });
+}
+
+function nextMessage(socket: WebSocket, timeoutMs = 8_000): Promise<string> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket message")), 2_000);
-    socket.addEventListener("message", (event) => {
+    const onMessage = (event: MessageEvent): void => {
       clearTimeout(timeout);
       resolve(String(event.data));
-    }, { once: true });
+    };
+    const timeout = setTimeout(() => {
+      socket.removeEventListener("message", onMessage);
+      reject(new Error("Timed out waiting for WebSocket message"));
+    }, timeoutMs);
+    socket.addEventListener("message", onMessage, { once: true });
   });
 }
 
 async function expectQuiet(socket: WebSocket, durationMs = 400): Promise<void> {
-  await expect(Promise.race([
-    nextMessage(socket).then(() => "message"),
-    new Promise<string>((resolve) => setTimeout(() => resolve("quiet"), durationMs))
-  ])).resolves.toBe("quiet");
+  const result = await new Promise<"message" | "quiet">((resolve) => {
+    const onMessage = (): void => {
+      clearTimeout(timeout);
+      resolve("message");
+    };
+    const timeout = setTimeout(() => {
+      socket.removeEventListener("message", onMessage);
+      resolve("quiet");
+    }, durationMs);
+    socket.addEventListener("message", onMessage, { once: true });
+  });
+  expect(result).toBe("quiet");
 }
 
 describe("Worker API", () => {
@@ -99,6 +146,55 @@ describe("Worker API", () => {
     expect(await response.json()).toMatchObject({ ok: true, authenticated: true });
     const row = await env.DB.prepare("SELECT COUNT(*) AS total FROM ingest_batches").first<{ total: number }>();
     expect(row?.total).toBe(0);
+    expect(await env.DB.prepare("SELECT 1 AS present FROM collector_binding WHERE slot=1").first()).toBeNull();
+
+    await env.DB.prepare("INSERT INTO collector_binding(slot, collector_id, claimed_at_ms) VALUES (1, ?, ?)")
+      .bind(payload.collectorId, Date.now()).run();
+    const same = await SELF.fetch(await signedRequest(batch(), { "x-snapmeter-doctor": "1" }));
+    expect(same.status).toBe(200);
+
+    const differentPayload = batch();
+    differentPayload.collectorId = "collector-doctor-conflict";
+    const different = await SELF.fetch(await signedRequest(differentPayload, { "x-snapmeter-doctor": "1" }));
+    expect(different.status).toBe(409);
+    expect(await different.json()).toEqual({ error: "collector_identity_conflict" });
+    const stillBound = await env.DB.prepare("SELECT collector_id FROM collector_binding WHERE slot=1")
+      .first<{ collector_id: string }>();
+    expect(stillBound?.collector_id).toBe(payload.collectorId);
+  });
+
+  it("accepts an exactly bounded signed body streamed without Content-Length", async () => {
+    const payload = batch();
+    const raw = paddedBatch(payload, MAX_INGEST_BODY_BYTES);
+    const request = await signedRawRequest(raw, payload.batchId, chunkedBody(raw), { "x-snapmeter-doctor": "1" });
+    expect(request.headers.has("content-length")).toBe(false);
+
+    const response = await SELF.fetch(request);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, authenticated: true });
+  });
+
+  it("stops a streamed body without Content-Length as soon as it exceeds the byte cap", async () => {
+    const payload = batch();
+    const raw = paddedBatch(payload, MAX_INGEST_BODY_BYTES + 1);
+    const request = await signedRawRequest(raw, payload.batchId, chunkedBody(raw));
+    expect(request.headers.has("content-length")).toBe(false);
+
+    const response = await SELF.fetch(request);
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: "payload_too_large" });
+  });
+
+  it("rejects an oversized declared Content-Length", async () => {
+    const payload = batch();
+    const raw = JSON.stringify(payload);
+    const request = await signedRawRequest(raw, payload.batchId, raw, {
+      "content-length": String(MAX_INGEST_BODY_BYTES + 1)
+    });
+
+    const response = await SELF.fetch(request);
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: "payload_too_large" });
   });
 
   it("rejects a modified body and stale replay timestamp", async () => {
@@ -131,6 +227,53 @@ describe("Worker API", () => {
     expect(await response.json()).toMatchObject({ error: "invalid_batch" });
   });
 
+  it("rejects authenticated future-dated state before it can poison monotonic storage", async () => {
+    const now = Date.now();
+    const future = now + 24 * 60 * 60_000;
+    const cases: Array<[string, (payload: ReturnType<typeof batch>) => void]> = [
+      ["sentAtMs", (payload) => { payload.sentAtMs = future; }],
+      ["snapshots.updatedAtMs", (payload) => { payload.snapshots = [{ ...emptySource("snapchain", future), updatedAtMs: future }]; }],
+      ["minuteBuckets.minuteStartMs", (payload) => { payload.minuteBuckets = [{ source: "snapchain", minuteStartMs: future, actions: 1, uniqueFids: 1, actionCounts: { cast: 1 } }]; }],
+      ["cursors.verifiedAtMs", (payload) => { payload.cursors = [{ source: "snapchain", shard: 1, eventId: "1", verifiedAtMs: future }]; }],
+      ["health.observedAtMs", (payload) => { payload.health = [{ source: "snapchain", sourceMode: "verified", status: "stale", observedAtMs: future, node: emptySource("snapchain", now).node, message: null }]; }],
+      ["actorDays.day", (payload) => { payload.actorDays = [{ source: "snapchain", day: "9999-12-31", fidHash: "a".repeat(64) }]; }]
+    ];
+
+    for (const [field, mutate] of cases) {
+      const payload = batch();
+      mutate(payload);
+      const response = await SELF.fetch(await signedRequest(payload));
+      expect(response.status, field).toBe(400);
+      expect(await response.json(), field).toMatchObject({ error: "invalid_batch_time", field });
+      const stored = await env.DB.prepare("SELECT 1 AS present FROM ingest_batches WHERE batch_id=?")
+        .bind(payload.batchId).first();
+      expect(stored, field).toBeNull();
+    }
+  });
+
+  it("rejects internally incoherent pulse and snapshot timestamps", async () => {
+    const pulsePayload = batch(crypto.randomUUID(), true);
+    pulsePayload.pulses[0]!.lastActionAtMs = pulsePayload.pulses[0]!.windowEndMs + 1;
+    const pulseResponse = await SELF.fetch(await signedRequest(pulsePayload));
+    expect(pulseResponse.status).toBe(400);
+    expect(await pulseResponse.json()).toMatchObject({ error: "invalid_batch_time", field: "pulses.lastActionAtMs" });
+
+    const now = Date.now();
+    const snapshotPayload = batch();
+    snapshotPayload.snapshots = [{ ...emptySource("snapchain", now), lastActionAtMs: now + 1 }];
+    const snapshotResponse = await SELF.fetch(await signedRequest(snapshotPayload));
+    expect(snapshotResponse.status).toBe(400);
+    expect(await snapshotResponse.json()).toMatchObject({ error: "invalid_batch_time", field: "snapshots.lastActionAtMs" });
+  });
+
+  it("accepts a delayed, newly signed retry of an old body", async () => {
+    const payload = batch();
+    payload.sentAtMs = Date.now() - 24 * 60 * 60_000;
+    const response = await SELF.fetch(await signedRequest(payload));
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ ok: true, batchId: payload.batchId });
+  });
+
   it("accepts each batch once and broadcasts a coalesced real pulse", async () => {
     const upgrade = await SELF.fetch("https://snapmeter.test/api/v1/live", { headers: { Upgrade: "websocket" } });
     expect(upgrade.status).toBe(101);
@@ -159,6 +302,63 @@ describe("Worker API", () => {
 
     await evictDurableObject(env.LIVE_ROOM.getByName("global"), { webSockets: "hibernate" });
     socket?.close(1000, "done");
+  });
+
+  it("claims the first real collector, permits it again, and rejects another before rate limit or persistence", async () => {
+    const first = batch();
+    first.collectorId = "collector-binding-primary";
+    expect((await SELF.fetch(await signedRequest(first))).status).toBe(202);
+    const binding = await env.DB.prepare("SELECT collector_id FROM collector_binding WHERE slot=1")
+      .first<{ collector_id: string }>();
+    expect(binding?.collector_id).toBe(first.collectorId);
+
+    const same = batch();
+    same.collectorId = first.collectorId;
+    expect((await SELF.fetch(await signedRequest(same))).status).toBe(202);
+
+    const conflict = batch();
+    conflict.collectorId = "collector-binding-secondary";
+    conflict.cursors = [{ source: "snapchain", shard: 1, eventId: "123", verifiedAtMs: Date.now() }];
+    const windowStartMs = Math.floor(Date.now() / 60_000) * 60_000;
+    const rateBefore = await env.DB.prepare(
+      "SELECT batch_count FROM rate_windows WHERE window_start_ms=? AND source='snapchain' AND collector_id=?"
+    ).bind(windowStartMs, SOURCE_RATE_SCOPE).first<{ batch_count: number }>();
+    const response = await SELF.fetch(await signedRequest(conflict));
+    expect(response.status).toBe(409);
+    const conflictBody = await response.text();
+    expect(JSON.parse(conflictBody)).toEqual({ error: "collector_identity_conflict" });
+    expect(await env.DB.prepare("SELECT 1 AS present FROM ingest_batches WHERE batch_id=?")
+      .bind(conflict.batchId).first()).toBeNull();
+    const rateAfter = await env.DB.prepare(
+      "SELECT batch_count FROM rate_windows WHERE window_start_ms=? AND source='snapchain' AND collector_id=?"
+    ).bind(windowStartMs, SOURCE_RATE_SCOPE).first<{ batch_count: number }>();
+    expect(rateAfter).toEqual(rateBefore);
+    expect(conflictBody).not.toContain(first.collectorId);
+    expect(conflictBody).not.toContain(conflict.collectorId);
+
+    await env.DB.prepare("DELETE FROM collector_binding WHERE slot=1").run();
+  });
+
+  it("atomically allows exactly one of two different first collectors to claim an empty dataset", async () => {
+    const left = batch();
+    left.collectorId = "collector-concurrent-left";
+    const right = batch();
+    right.collectorId = "collector-concurrent-right";
+    const responses = await Promise.all([
+      SELF.fetch(await signedRequest(left)),
+      SELF.fetch(await signedRequest(right))
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([202, 409]);
+    const bound = await env.DB.prepare("SELECT collector_id FROM collector_binding WHERE slot=1")
+      .first<{ collector_id: string }>();
+    expect([left.collectorId, right.collectorId]).toContain(bound?.collector_id);
+    const stored = await env.DB.prepare(
+      "SELECT collector_id FROM ingest_batches WHERE batch_id IN (?, ?)"
+    ).bind(left.batchId, right.batchId).all<{ collector_id: string }>();
+    expect(stored.results).toHaveLength(1);
+    expect(stored.results[0]?.collector_id).toBe(bound?.collector_id);
+
+    await env.DB.prepare("DELETE FROM collector_binding WHERE slot=1").run();
   });
 
   it("does not charge authenticated known-batch replays against a saturated source budget", async () => {
@@ -235,10 +435,14 @@ describe("Worker API", () => {
       WHEN NEW.collector_id = 'collector-persist-failure-test'
       BEGIN SELECT RAISE(ABORT, 'forced_persist_failure'); END
     `).run();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       const response = await SELF.fetch(await signedRequest(payload));
       expect(response.status).toBe(500);
       expect(await response.json()).toMatchObject({ error: "ingest_failed" });
+      const logs = consoleError.mock.calls.flat().join(" ");
+      expect(logs).toContain('"errorKind":"error"');
+      expect(logs).not.toContain("forced_persist_failure");
       const after = await env.DB.prepare(
         "SELECT batch_count FROM rate_windows WHERE source='snapchain' AND collector_id=? AND window_start_ms=?"
       ).bind(SOURCE_RATE_SCOPE, windowStartMs).first<{ batch_count: number }>();
@@ -247,6 +451,7 @@ describe("Worker API", () => {
         .bind(payload.batchId).first();
       expect(stored).toBeNull();
     } finally {
+      consoleError.mockRestore();
       await env.DB.prepare("DROP TRIGGER IF EXISTS reject_test_ingest").run();
     }
   });
@@ -258,6 +463,7 @@ describe("Worker API", () => {
     await nextMessage(socket);
     const payload = batch(crypto.randomUUID(), true);
     payload.pulses[0]!.windowEndMs = Date.now() - 121_000;
+    payload.pulses[0]!.windowStartMs = payload.pulses[0]!.windowEndMs - 250;
     payload.pulses[0]!.lastActionAtMs = payload.pulses[0]!.windowEndMs;
     const response = await SELF.fetch(await signedRequest(payload));
     expect(response.status).toBe(202);
@@ -272,7 +478,8 @@ describe("Worker API", () => {
   });
 
   it("hydrates a new WebSocket with the latest accepted snapshot", async () => {
-    const now = Date.now();
+    const base = batch();
+    const now = base.sentAtMs;
     const snapchain = {
       ...emptySource("snapchain", now),
       status: "live" as const,
@@ -293,7 +500,6 @@ describe("Worker API", () => {
         historyComplete: true
       }
     };
-    const base = batch();
     const payload = { ...base, snapshots: [snapchain] };
     const accepted = await SELF.fetch(await signedRequest(payload));
     expect(accepted.status).toBe(202);
@@ -443,7 +649,8 @@ describe("Worker API", () => {
   });
 
   it("hydrates a new WebSocket with freshness-adjusted disconnected state", async () => {
-    const now = Date.now();
+    const base = batch();
+    const now = base.sentAtMs;
     const snapchain = {
       ...emptySource("snapchain", now),
       status: "live" as const,
@@ -459,7 +666,7 @@ describe("Worker API", () => {
         historyComplete: true
       }
     };
-    const payload = { ...batch(), snapshots: [snapchain] };
+    const payload = { ...base, snapshots: [snapchain] };
     expect((await SELF.fetch(await signedRequest(payload))).status).toBe(202);
     const upgrade = await SELF.fetch("https://snapmeter.test/api/v1/live", { headers: { Upgrade: "websocket" } });
     const socket = upgrade.webSocket!;
@@ -469,7 +676,8 @@ describe("Worker API", () => {
   });
 
   it("preserves partial quality while 30-day history is incomplete", async () => {
-    const now = Date.now();
+    const base = batch();
+    const now = base.sentAtMs;
     const snapchain = {
       ...emptySource("snapchain", now),
       status: "partial" as const,
@@ -485,7 +693,7 @@ describe("Worker API", () => {
         historyComplete: false
       }
     };
-    const payload = { ...batch(), snapshots: [snapchain] };
+    const payload = { ...base, snapshots: [snapchain] };
     expect((await SELF.fetch(await signedRequest(payload))).status).toBe(202);
     const summary = await SELF.fetch("https://snapmeter.test/api/v1/summary");
     expect(await summary.json()).toMatchObject({ sources: { snapchain: { status: "partial", quality: "degraded", node: { historyComplete: false } } } });

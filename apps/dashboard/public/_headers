@@ -2,8 +2,14 @@
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
-  Cross-Origin-Opener-Policy: same-origin
-  Content-Security-Policy: default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
+  Content-Security-Policy: default-src 'self'; connect-src 'self' https://auth.farcaster.xyz ws: wss:; img-src 'self' data:; style-src 'self'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; script-src 'self'; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; worker-src 'self'; manifest-src 'self'
+
+/.well-known/farcaster.json
+  Cache-Control: no-cache
+  Content-Type: application/json; charset=utf-8
+
+/images/miniapp/*
+  Cache-Control: public, max-age=86400
 
 /api/*
   Cache-Control: no-store

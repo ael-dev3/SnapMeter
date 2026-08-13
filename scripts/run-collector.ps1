@@ -75,12 +75,22 @@ Write-Host $headerLine
 $nativeExitCode = 1
 Push-Location $repositoryRoot
 try {
-    & $resolvedPnpm collector $Mode 2>&1 | ForEach-Object {
-        $line = Protect-SnapMeterText -InputObject $_
-        Add-Content -LiteralPath $logPath -Value $line
-        Write-Output $line
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell wraps a native application's stderr as a
+        # non-terminating ErrorRecord. Do not let a harmless pnpm banner abort
+        # the log reader and orphan its long-running child process.
+        $ErrorActionPreference = 'Continue'
+        # pnpm buffers recursive package output unless streaming is explicit.
+        & $resolvedPnpm --stream collector $Mode 2>&1 | ForEach-Object {
+            $line = Protect-SnapMeterText -InputObject $_
+            Add-Content -LiteralPath $logPath -Value $line
+            Write-Output $line
+        }
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
     }
-    $nativeExitCode = $LASTEXITCODE
 } finally {
     Pop-Location
 }

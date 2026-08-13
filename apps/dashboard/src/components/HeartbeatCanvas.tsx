@@ -2,22 +2,52 @@ import { useEffect, useRef } from "react";
 import type { Source } from "@snapmeter/contracts";
 import type { PulseState } from "../hooks/useLiveMetrics";
 import { useReducedMotion } from "../hooks/useReducedMotion";
+import { ageFrom } from "../lib/format";
+import { buildHeartbeatGeometry } from "./heartbeatGeometry";
 
 const POINTS = 156;
 
-function signature(source: Source, amplitude: number): number[] {
-  const shape = source === "snapchain"
-    ? [0, 0.08, -0.16, 0.95, -0.48, 0.22, 0.05, 0]
-    : [0, 0.18, -0.1, 0.62, -0.3, 0.86, -0.42, 0.16, 0];
-  return shape.map((point) => point * amplitude);
+interface PendingSample {
+  value: number;
+  depth: number;
+  torsion: number;
 }
 
-export function HeartbeatCanvas({ source, pulse }: { source: Source; pulse: PulseState }): React.JSX.Element {
+interface TracePoint {
+  x: number;
+  y: number;
+}
+
+function smoothPath(context: CanvasRenderingContext2D, points: TracePoint[]): void {
+  if (points.length === 0) return;
+  context.moveTo(points[0]!.x, points[0]!.y);
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const current = points[index]!;
+    const next = points[index + 1]!;
+    context.quadraticCurveTo(current.x, current.y, (current.x + next.x) / 2, (current.y + next.y) / 2);
+  }
+  const last = points.at(-1)!;
+  context.lineTo(last.x, last.y);
+}
+
+export function HeartbeatCanvas({
+  source,
+  pulse,
+  signalAtMs,
+  now
+}: {
+  source: Source;
+  pulse: PulseState;
+  signalAtMs: number | null;
+  now: number;
+}): React.JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef({
     samples: new Float32Array(POINTS),
+    depths: new Float32Array(POINTS),
+    torsion: new Float32Array(POINTS),
     cursor: 0,
-    pending: [] as number[],
+    pending: [] as PendingSample[],
     pendingIndex: 0,
     lastAdvance: 0,
     pulseId: 0
@@ -27,8 +57,12 @@ export function HeartbeatCanvas({ source, pulse }: { source: Source; pulse: Puls
   useEffect(() => {
     if (pulse.id <= stateRef.current.pulseId || pulse.count <= 0) return;
     stateRef.current.pulseId = pulse.id;
-    const amplitude = Math.min(1, 0.34 + Math.log2(pulse.count + 1) / 7);
-    stateRef.current.pending = signature(source, amplitude);
+    const geometry = buildHeartbeatGeometry(source, pulse.id, pulse.count);
+    stateRef.current.pending = geometry.samples.map((value, index) => ({
+      value,
+      depth: geometry.depths[index] ?? 0,
+      torsion: geometry.torsion[index] ?? 0
+    }));
     stateRef.current.pendingIndex = 0;
   }, [pulse.count, pulse.id, source]);
 
@@ -54,14 +88,20 @@ export function HeartbeatCanvas({ source, pulse }: { source: Source; pulse: Puls
 
       const state = stateRef.current;
       if (!reducedMotion && time - state.lastAdvance >= 28) {
-        const next = state.pendingIndex < state.pending.length ? state.pending[state.pendingIndex] ?? 0 : 0;
-        state.samples[state.cursor] = next;
+        const next = state.pendingIndex < state.pending.length
+          ? state.pending[state.pendingIndex] ?? { value: 0, depth: 0, torsion: 0 }
+          : { value: 0, depth: 0, torsion: 0 };
+        state.samples[state.cursor] = next.value;
+        state.depths[state.cursor] = next.depth;
+        state.torsion[state.cursor] = next.torsion;
         state.cursor = (state.cursor + 1) % POINTS;
         if (state.pendingIndex < state.pending.length) state.pendingIndex += 1;
         state.lastAdvance = time;
       } else if (reducedMotion && state.pendingIndex < state.pending.length) {
-        for (const value of state.pending) {
-          state.samples[state.cursor] = value;
+        for (const sample of state.pending) {
+          state.samples[state.cursor] = sample.value;
+          state.depths[state.cursor] = sample.depth;
+          state.torsion[state.cursor] = sample.torsion;
           state.cursor = (state.cursor + 1) % POINTS;
         }
         state.pendingIndex = state.pending.length;
@@ -71,7 +111,7 @@ export function HeartbeatCanvas({ source, pulse }: { source: Source; pulse: Puls
       const baseline = Math.round(height * 0.52) + 0.5;
       const color = source === "snapchain" ? "75, 221, 255" : "188, 127, 255";
 
-      context.strokeStyle = `rgba(${color}, .13)`;
+      context.strokeStyle = `rgba(${color}, .09)`;
       context.lineWidth = 1;
       context.setLineDash([2, 7]);
       context.beginPath();
@@ -80,26 +120,52 @@ export function HeartbeatCanvas({ source, pulse }: { source: Source; pulse: Puls
       context.stroke();
       context.setLineDash([]);
 
-      const trace = (): void => {
+      const front: TracePoint[] = [];
+      const rear: TracePoint[] = [];
+      const depthPixels = Math.max(0.8, Math.min(2.5, height * 0.036));
+      for (let index = 0; index < POINTS; index += 1) {
+        const bufferIndex = (state.cursor + index) % POINTS;
+        const sample = state.samples[bufferIndex] ?? 0;
+        const depth = state.depths[bufferIndex] ?? 0;
+        const torsion = state.torsion[bufferIndex] ?? 0;
+        const x = (index / (POINTS - 1)) * width;
+        front.push({
+          x: x + torsion * depthPixels * 0.22,
+          y: baseline - sample * height * 0.34 - torsion * depthPixels * 0.16
+        });
+        rear.push({
+          x: x - depth * depthPixels * 0.46,
+          y: baseline - sample * height * 0.305 + depth * depthPixels + torsion * depthPixels * 0.32
+        });
+      }
+
+      const trace = (points: TracePoint[]): void => {
         context.beginPath();
-        for (let index = 0; index < POINTS; index += 1) {
-          const sample = state.samples[(state.cursor + index) % POINTS] ?? 0;
-          const x = (index / (POINTS - 1)) * width;
-          const y = baseline - sample * height * 0.39;
-          if (index === 0) context.moveTo(x, y);
-          else context.lineTo(x, y);
-        }
+        smoothPath(context, points);
         context.stroke();
       };
 
       context.lineJoin = "round";
       context.lineCap = "round";
-      context.strokeStyle = `rgba(${color}, .18)`;
-      context.lineWidth = 7;
-      trace();
-      context.strokeStyle = `rgba(${color}, .92)`;
-      context.lineWidth = 1.4;
-      trace();
+
+      context.beginPath();
+      smoothPath(context, front);
+      for (let index = rear.length - 1; index >= 0; index -= 1) {
+        context.lineTo(rear[index]!.x, rear[index]!.y);
+      }
+      context.closePath();
+      context.fillStyle = `rgba(${color}, .032)`;
+      context.fill();
+
+      context.strokeStyle = `rgba(${color}, .13)`;
+      context.lineWidth = 2.2;
+      trace(rear);
+      context.strokeStyle = `rgba(${color}, .05)`;
+      context.lineWidth = 4.2;
+      trace(front);
+      context.strokeStyle = `rgba(${color}, .7)`;
+      context.lineWidth = 1.1;
+      trace(front);
 
       if (!reducedMotion) frame = window.requestAnimationFrame(draw);
     };
@@ -115,14 +181,18 @@ export function HeartbeatCanvas({ source, pulse }: { source: Source; pulse: Puls
     };
   }, [reducedMotion, source, pulse.id]);
 
-  const eventText = pulse.observedAtMs === null
-    ? "No live pulse received in this session"
-    : `${pulse.count.toLocaleString()} qualifying ${pulse.count === 1 ? "event" : "events"} in the latest live pulse`;
+  const signalAge = signalAtMs === null ? null : ageFrom(signalAtMs, now);
+  const eventText = pulse.lastActionAtMs === null
+    ? signalAge === null
+      ? "No qualifying action recorded"
+      : `Last recorded action ${signalAge} · awaiting a live pulse`
+    : `${pulse.count.toLocaleString()} qualifying ${pulse.count === 1 ? "action" : "actions"} · last action ${signalAge}`;
 
   return (
     <div className="heartbeat" data-testid={`heartbeat-${source}`} data-pulse-id={pulse.id}>
+      {pulse.id > 0 && !reducedMotion && <span className="heartbeat-bloom" aria-hidden="true" key={`${source}-${pulse.id}`} />}
       <div className="heartbeat-heading">
-        <span>Live heartbeat</span>
+        <span>Action heartbeat</span>
         <span className="heartbeat-event" aria-live="polite" aria-atomic="true">{eventText}</span>
       </div>
       <canvas ref={canvasRef} aria-hidden="true" />

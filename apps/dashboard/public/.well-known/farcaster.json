@@ -1,0 +1,35 @@
+{
+  "accountAssociation": {
+    "header": "eyJmaWQiOjUzOTg1NCwidHlwZSI6ImN1c3RvZHkiLCJrZXkiOiIweDdhOUU2OTY1RkNGMWFkMmNmYmZmNjdmMEMwYUExMDJGMERFYTIzZDQifQ",
+    "payload": "eyJkb21haW4iOiJzbmFwbWV0ZXIuYWVsLWRldjMud29ya2Vycy5kZXYifQ",
+    "signature": "5Gr9lK04ezDIgFvk6SSuBMFeJLQW/ZhKglNMXAFqjegpD30Jg/yzb62XSOkvSv7JrTVIV0UnpxBmtD2auuWJ3Bs="
+  },
+  "miniapp": {
+    "version": "1",
+    "name": "SnapMeter",
+    "homeUrl": "https://snapmeter.ael-dev3.workers.dev/?miniApp=true",
+    "iconUrl": "https://snapmeter.ael-dev3.workers.dev/images/miniapp/icon.png",
+    "splashImageUrl": "https://snapmeter.ael-dev3.workers.dev/images/miniapp/splash.png",
+    "splashBackgroundColor": "#07090C",
+    "subtitle": "Live Farcaster activity",
+    "description": "Compare live activity across Snapchain and Hypersnap with transparent source health and rolling Farcaster metrics.",
+    "screenshotUrls": [
+      "https://snapmeter.ael-dev3.workers.dev/images/miniapp/screenshot.png"
+    ],
+    "primaryCategory": "developer-tools",
+    "tags": [
+      "farcaster",
+      "snapchain",
+      "hypersnap",
+      "analytics",
+      "metrics"
+    ],
+    "heroImageUrl": "https://snapmeter.ael-dev3.workers.dev/images/miniapp/hero.png",
+    "tagline": "Watch the network breathe",
+    "ogTitle": "SnapMeter",
+    "ogDescription": "Live Snapchain and Hypersnap activity with transparent source health.",
+    "ogImageUrl": "https://snapmeter.ael-dev3.workers.dev/images/miniapp/og.png",
+    "noindex": false,
+    "canonicalDomain": "snapmeter.ael-dev3.workers.dev"
+  }
+}

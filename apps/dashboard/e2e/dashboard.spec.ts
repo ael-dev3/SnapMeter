@@ -3,7 +3,13 @@ import { createDemoSummary } from "../src/data/demo";
 
 async function mockLive(page: Page, statuses: [string, string] = ["live", "derived"]): Promise<void> {
   const summary = createDemoSummary();
+  const nowMs = Date.now();
   summary.demo = false;
+  summary.generatedAtMs = nowMs;
+  summary.sources.snapchain.updatedAtMs = nowMs;
+  summary.sources.snapchain.lastCollectorAtMs = nowMs;
+  summary.sources.hypersnap.updatedAtMs = nowMs;
+  summary.sources.hypersnap.lastCollectorAtMs = nowMs;
   summary.sources.snapchain.status = statuses[0] as typeof summary.sources.snapchain.status;
   summary.sources.hypersnap.status = statuses[1] as typeof summary.sources.hypersnap.status;
   await page.route("**/api/v1/summary", (route) => route.fulfill({ json: summary }));
@@ -85,7 +91,9 @@ test.describe("mobile portrait overview", () => {
     });
     await page.goto("/");
     await expect(page.getByTestId("heartbeat-snapchain")).toHaveAttribute("data-pulse-id", "1");
-    await expect(page.getByTestId("heartbeat-snapchain")).toContainText("24 qualifying events");
+    await expect(page.getByTestId("heartbeat-snapchain")).toContainText("24 qualifying actions");
+    await expect(page.locator(".panel-glow")).toHaveCount(0);
+    await expect(page.getByTestId("heartbeat-snapchain").locator(".heartbeat-bloom")).toHaveCount(1);
   });
 
   test("retains a trustworthy snapshot and signals browser offline", async ({ page, context }) => {

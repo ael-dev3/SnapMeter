@@ -124,6 +124,23 @@ export interface PendingLiveDelivery {
   leaseToken: string;
 }
 
+export async function claimCollectorBinding(env: Env, collectorId: string, claimedAtMs: number): Promise<boolean> {
+  const result = await env.DB.prepare(`
+    INSERT INTO collector_binding(slot, collector_id, claimed_at_ms)
+    VALUES (1, ?, ?)
+    ON CONFLICT(slot) DO UPDATE SET claimed_at_ms = collector_binding.claimed_at_ms
+    WHERE collector_binding.collector_id = excluded.collector_id
+    RETURNING collector_id
+  `).bind(collectorId, claimedAtMs).first<{ collector_id: string }>();
+  return result?.collector_id === collectorId;
+}
+
+export async function collectorBindingAllows(env: Env, collectorId: string): Promise<boolean> {
+  const result = await env.DB.prepare("SELECT collector_id FROM collector_binding WHERE slot=1")
+    .first<{ collector_id: string }>();
+  return result === null || result.collector_id === collectorId;
+}
+
 export async function pendingLiveDeliveries(env: Env, limit = 20, nowMs = Date.now(), leaseMs = 30_000): Promise<PendingLiveDelivery[]> {
   const result = await env.DB.prepare(
     "SELECT batch_id, payload_json FROM live_delivery_outbox WHERE published_at_ms IS NULL AND (lease_until_ms IS NULL OR lease_until_ms<=?) ORDER BY created_at_ms, batch_id LIMIT ?"

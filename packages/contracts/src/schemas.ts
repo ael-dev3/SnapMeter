@@ -42,8 +42,20 @@ export type ActionFamily = z.infer<typeof ActionFamilySchema>;
 
 export const TrendLabelSchema = z.enum(["Improving", "Worsening", "Stable", "Insufficient data"]);
 
+const UTC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function isRealUtcDay(value: string): boolean {
+  if (!UTC_DAY_PATTERN.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+export const UtcDaySchema = z.string().refine(isRealUtcDay, {
+  message: "Expected a real UTC calendar day in YYYY-MM-DD format"
+});
+
 export const DailyDatumSchema = z.object({
-  day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  day: UtcDaySchema,
   activeFids: z.number().int().nonnegative(),
   actions: z.number().int().nonnegative()
 });
@@ -142,7 +154,7 @@ export const PulsePacketSchema = z.object({
   uniqueFids: z.number().int().positive(),
   actionCounts: z.partialRecord(ActionFamilySchema, z.number().int().nonnegative()),
   lastActionAtMs: z.number().int().nonnegative(),
-  maxEventId: z.string(),
+  maxEventId: z.string().regex(/^\d+$/),
   isReplay: z.literal(false)
 });
 export type PulsePacket = z.infer<typeof PulsePacketSchema>;
@@ -158,8 +170,8 @@ export type MinuteBucket = z.infer<typeof MinuteBucketSchema>;
 
 export const ActorDaySchema = z.object({
   source: SourceSchema,
-  day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  fidHash: z.string().min(16).max(128)
+  day: UtcDaySchema,
+  fidHash: z.string().regex(/^[0-9a-f]{64}$/)
 });
 export type ActorDay = z.infer<typeof ActorDaySchema>;
 
