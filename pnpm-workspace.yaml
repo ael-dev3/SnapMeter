@@ -1,0 +1,16 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  protobufjs: true
+  workerd: true
+
+minimumReleaseAgeExclude:
+  - '@cloudflare/vite-plugin@1.52.0'
+  - '@cloudflare/vitest-pool-workers@0.21.2'
+  - '@cloudflare/workers-types@5.20260813.1'
+  - globals@17.11.0
+  - miniflare@5.20260811.0-alpha
+  - wrangler@4.122.0

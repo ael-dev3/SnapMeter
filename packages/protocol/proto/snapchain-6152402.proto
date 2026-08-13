@@ -1,0 +1,143 @@
+// Wire-compatible analytics subset vendored from farcasterxyz/snapchain at
+// 6152402aea2dbe732fb73076f674b038bfd4aee5. Unknown upstream fields are safely
+// ignored by protobuf. See docs/upstream-sources.md.
+syntax = "proto3";
+
+enum HubEventType {
+  HUB_EVENT_TYPE_NONE = 0;
+  HUB_EVENT_TYPE_MERGE_MESSAGE = 1;
+  HUB_EVENT_TYPE_PRUNE_MESSAGE = 2;
+  HUB_EVENT_TYPE_REVOKE_MESSAGE = 3;
+  HUB_EVENT_TYPE_MERGE_USERNAME_PROOF = 6;
+  HUB_EVENT_TYPE_MERGE_ON_CHAIN_EVENT = 9;
+  HUB_EVENT_TYPE_MERGE_FAILURE = 10;
+  HUB_EVENT_TYPE_BLOCK_CONFIRMED = 11;
+  HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT = 12;
+}
+
+enum MessageType {
+  MESSAGE_TYPE_NONE = 0;
+  MESSAGE_TYPE_CAST_ADD = 1;
+  MESSAGE_TYPE_CAST_REMOVE = 2;
+  MESSAGE_TYPE_REACTION_ADD = 3;
+  MESSAGE_TYPE_REACTION_REMOVE = 4;
+  MESSAGE_TYPE_LINK_ADD = 5;
+  MESSAGE_TYPE_LINK_REMOVE = 6;
+  MESSAGE_TYPE_VERIFICATION_ADD_ETH_ADDRESS = 7;
+  MESSAGE_TYPE_VERIFICATION_REMOVE = 8;
+  MESSAGE_TYPE_USER_DATA_ADD = 11;
+  MESSAGE_TYPE_USERNAME_PROOF = 12;
+  MESSAGE_TYPE_FRAME_ACTION = 13;
+  MESSAGE_TYPE_LINK_COMPACT_STATE = 14;
+  MESSAGE_TYPE_LEND_STORAGE = 15;
+  MESSAGE_TYPE_KEY_ADD = 16;
+  MESSAGE_TYPE_KEY_REMOVE = 17;
+  MESSAGE_TYPE_CHANNEL_UPDATE = 18;
+  MESSAGE_TYPE_CHANNEL_MEMBER = 19;
+  MESSAGE_TYPE_CHANNEL_PIN = 20;
+  MESSAGE_TYPE_CHANNEL_MODERATE = 21;
+}
+
+message MessageData {
+  MessageType type = 1;
+  uint64 fid = 2;
+  uint32 timestamp = 3;
+  int32 network = 4;
+}
+
+message Message {
+  MessageData data = 1;
+  bytes hash = 2;
+  int32 hash_scheme = 3;
+  bytes signature = 4;
+  int32 signature_scheme = 5;
+  bytes signer = 6;
+  optional bytes data_bytes = 7;
+}
+
+message MergeMessageBody {
+  Message message = 1;
+  repeated Message deleted_messages = 2;
+}
+
+message BlockConfirmedBody {
+  uint64 block_number = 1;
+  uint32 shard_index = 2;
+  uint64 timestamp = 3;
+  bytes block_hash = 4;
+  uint64 total_events = 5;
+  map<int32, uint64> event_counts_by_type = 6;
+  uint64 max_block_event_seqnum = 7;
+}
+
+message HubEvent {
+  HubEventType type = 1;
+  uint64 id = 2;
+  oneof body {
+    MergeMessageBody merge_message_body = 3;
+    BlockConfirmedBody block_confirmed_body = 16;
+  }
+  uint64 block_number = 12;
+  uint32 shard_index = 14;
+  uint64 timestamp = 15;
+}
+
+message SubscribeRequest {
+  repeated HubEventType event_types = 1;
+  optional uint64 from_id = 2;
+  optional uint32 shard_index = 4;
+}
+
+message DbStats {
+  uint64 num_messages = 1;
+  uint64 num_fid_registrations = 2;
+  uint64 approx_size = 4;
+}
+
+message ShardInfo {
+  uint32 shard_id = 1;
+  uint64 max_height = 2;
+  uint64 num_messages = 3;
+  uint64 num_fid_registrations = 4;
+  uint64 approx_size = 5;
+  uint64 block_delay = 6;
+  uint64 mempool_size = 7;
+  uint64 num_onchain_events = 8;
+}
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  string version = 1;
+  DbStats db_stats = 5;
+  string peerId = 6;
+  uint32 num_shards = 8;
+  repeated ShardInfo shard_infos = 9;
+  uint64 next_engine_version_timestamp = 10;
+}
+
+message EventRequest {
+  uint64 id = 1;
+  uint32 shard_index = 5;
+}
+
+message EventsRequest {
+  uint64 start_id = 1;
+  optional uint32 shard_index = 2;
+  optional uint64 stop_id = 3;
+  optional uint32 page_size = 4;
+  optional bytes page_token = 5;
+  optional bool reverse = 6;
+}
+
+message EventsResponse {
+  repeated HubEvent events = 1;
+  optional bytes next_page_token = 2;
+}
+
+service HubService {
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream HubEvent);
+  rpc GetEvent(EventRequest) returns (HubEvent);
+  rpc GetEvents(EventsRequest) returns (EventsResponse);
+}

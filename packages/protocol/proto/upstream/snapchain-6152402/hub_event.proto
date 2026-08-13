@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+import "message.proto";
+import "onchain_event.proto";
+import "username_proof.proto";
+
+enum HubEventType {
+  HUB_EVENT_TYPE_NONE = 0;
+  HUB_EVENT_TYPE_MERGE_MESSAGE = 1;
+  HUB_EVENT_TYPE_PRUNE_MESSAGE = 2;
+  HUB_EVENT_TYPE_REVOKE_MESSAGE = 3;
+  // Deprecated
+  //  HUB_EVENT_TYPE_MERGE_ID_REGISTRY_EVENT = 4;
+  //  HUB_EVENT_TYPE_MERGE_NAME_REGISTRY_EVENT = 5;
+  HUB_EVENT_TYPE_MERGE_USERNAME_PROOF = 6;
+  // Deprecated
+  //  HUB_EVENT_TYPE_MERGE_RENT_REGISTRY_EVENT = 7;
+  //  HUB_EVENT_TYPE_MERGE_STORAGE_ADMIN_REGISTRY_EVENT = 8;
+  HUB_EVENT_TYPE_MERGE_ON_CHAIN_EVENT = 9;
+  HUB_EVENT_TYPE_MERGE_FAILURE = 10;
+  HUB_EVENT_TYPE_BLOCK_CONFIRMED = 11;
+  HUB_EVENT_TYPE_CHANNEL_OWNER_CHANGE_HINT = 12;
+}
+
+// What caused a channel's recorded owner to (possibly) change. NONE (0) is the
+// proto3 zero-default and is never emitted on a real hint; treat a NONE or
+// otherwise unrecognized cause as "re-read the owner" and do not assume the set
+// of causes is closed — new causes may be added over time. RENEW is
+// deliberately absent: extending a registration's expiry is not an ownership
+// change, so renewals emit no hint.
+enum ChannelOwnerChangeCause {
+  CHANNEL_OWNER_CHANGE_CAUSE_NONE = 0;
+  CHANNEL_OWNER_CHANGE_CAUSE_REGISTER = 1;
+  CHANNEL_OWNER_CHANGE_CAUSE_TRANSFER = 2;
+  CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_ADD = 3;
+  CHANNEL_OWNER_CHANGE_CAUSE_VERIFICATION_REMOVE = 4;
+}
+
+message MergeMessageBody {
+  Message message = 1;
+  repeated Message deleted_messages = 2;
+}
+
+message MergeFailureBody {
+  Message message = 1;
+  string code = 2;
+  string reason = 3;
+}
+
+message PruneMessageBody {
+  Message message = 1;
+}
+
+message RevokeMessageBody {
+  Message message = 1;
+}
+
+message BlockConfirmedBody {
+  uint64 block_number = 1;
+  uint32 shard_index = 2;
+  uint64 timestamp = 3;
+  bytes block_hash = 4;
+  uint64 total_events = 5;
+  map<int32, uint64> event_counts_by_type = 6;
+  uint64 max_block_event_seqnum = 7;
+}
+
+message MergeOnChainEventBody {
+  OnChainEvent on_chain_event = 1;
+}
+
+message MergeUserNameProofBody {
+  UserNameProof username_proof = 1;
+  UserNameProof deleted_username_proof = 2;
+  Message username_proof_message = 3;
+  Message deleted_username_proof_message = 4;
+}
+
+// A trigger telling consumers that a channel's owner may have changed. It is a
+// nudge, not authoritative data — it carries no resolved owner. CONSUMER
+// CONTRACT (stable API):
+//   - Delivery is at-least-once across the full shard set (see the coverage
+//     note below) and may over-emit: the resolved winner may not have actually
+//     changed since the last hint. Treat a hint as "re-read", never as "the
+//     owner is now X".
+//   - Hints carry NO fid claims. On receipt, call GetChannelOwner to learn the
+//     current owner; this body's owner_address is a raw registry-owner address,
+//     not an authoritative resolution.
+//   - REGISTER/TRANSFER hints ride the shard-0 -> data-shard fan-out. The
+//     LATEST ownership update of a channel hints on every shard, but any single
+//     shard may COALESCE a rapid same-channel burst down to just the latest
+//     hint, so no single shard's stream is guaranteed to carry every hint.
+//     VERIFICATION_ADD/REMOVE hints appear only on the verifier's home shard.
+//     Complete coverage therefore requires subscribing to all shards and, as
+//     above, treating each hint as a re-read trigger rather than a full log.
+//   - Nothing fires when a lapsed registration's grace period ends (the chain
+//     is silent at expiry); consumers apply expiry themselves.
+message ChannelOwnerChangeHintBody {
+  // Channel identifier; pass this to GetChannelOwner to resolve the current
+  // owner.
+  string channel_key = 1;
+  // Raw 20-byte EVM registry-owner address the hint concerns: for
+  // REGISTER/TRANSFER, the newly-recorded owner; for VERIFICATION_ADD/REMOVE,
+  // the owner address whose verification changed. Not an authoritative
+  // resolution — consumers call GetChannelOwner.
+  bytes owner_address = 2;
+  ChannelOwnerChangeCause cause = 3;
+}
+
+message HubEvent {
+  HubEventType type = 1;
+  uint64 id = 2;
+  oneof body {
+    MergeMessageBody merge_message_body = 3;
+    PruneMessageBody prune_message_body = 4;
+    RevokeMessageBody revoke_message_body = 5;
+    //    Deprecated
+    //    MergeIdRegistryEventBody merge_id_registry_event_body = 6;
+    //    MergeNameRegistryEventBody merge_name_registry_event_body = 7;
+    MergeUserNameProofBody merge_username_proof_body = 8;
+    //    Deprecated
+    //    MergeRentRegistryEventBody merge_rent_registry_event_body = 9;
+    //    MergeStorageAdminRegistryEventBody merge_storage_admin_registry_event_body = 10;
+    MergeOnChainEventBody merge_on_chain_event_body = 11;
+    MergeFailureBody merge_failure = 13;
+    BlockConfirmedBody block_confirmed_body = 16;
+    ChannelOwnerChangeHintBody channel_owner_change_hint_body = 17;
+  };
+  uint64 block_number = 12;
+  uint32 shard_index = 14;
+  uint64 timestamp = 15;
+}

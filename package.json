@@ -1,0 +1,32 @@
+{
+  "name": "snapmeter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "collector": "pnpm --filter @snapmeter/collector collector",
+    "dev": "pnpm --filter @snapmeter/dashboard dev",
+    "lint": "eslint .",
+    "test": "vitest run && pnpm --filter @snapmeter/dashboard test && pnpm --filter @snapmeter/dashboard test:worker",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "pnpm --filter @snapmeter/dashboard test:e2e",
+    "typecheck": "pnpm -r --if-present typecheck"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.62.1",
+    "@types/node": "24.10.13",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "10.8.1",
+    "globals": "17.11.0",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.10"
+  }
+}

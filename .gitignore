@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+.wrangler/
+.dev.vars*
+.env*
+!.env.example
+.collector.env
+*.db
+*.db-shm
+*.db-wal
+*.log
+playwright-report/
+test-results/
+blob-report/
+apps/dashboard/public/screenshot.jpeg
+work/
