@@ -25,23 +25,23 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.52.0",
-    "@cloudflare/vitest-pool-workers": "0.21.2",
-    "@cloudflare/workers-types": "5.20260813.1",
+    "@cloudflare/vite-plugin": "1.52.1",
+    "@cloudflare/vitest-pool-workers": "0.21.3",
+    "@cloudflare/workers-types": "5.20260814.1",
     "@farcaster/miniapp-core": "0.6.0",
     "@playwright/test": "1.62.1",
     "@testing-library/dom": "10.4.1",
-    "@testing-library/jest-dom": "6.8.0",
-    "@testing-library/react": "16.3.0",
-    "@testing-library/user-event": "14.6.1",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.4",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
     "@vitejs/plugin-react": "6.0.5",
-    "jsdom": "26.1.0",
-    "typescript": "5.9.3",
-    "viem": "2.55.0",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "viem": "2.55.15",
     "vite": "8.2.1",
     "vitest": "4.1.10",
-    "wrangler": "4.122.0"
+    "wrangler": "4.123.0"
   }
 }
