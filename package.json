@@ -20,14 +20,14 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@playwright/test": "1.62.1",
-    "@types/node": "24.10.13",
-    "@vitest/coverage-v8": "4.1.10",
-    "eslint": "10.8.1",
-    "globals": "17.11.0",
-    "tsx": "4.23.12",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.67.0",
-    "vitest": "4.1.10"
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5",
+    "@vitest/coverage-v8": "5.0.4",
+    "eslint": "10.12.0",
+    "globals": "17.13.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.71.2",
+    "vitest": "5.0.4"
   }
 }
