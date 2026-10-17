@@ -1,9 +1,10 @@
 # Security policy
 
-## Supported version
+## Maintenance status
 
-Security fixes are applied to the latest commit on `main`. Older commits and
-operator-modified deployments are not supported independently.
+Development is halted. No version is actively maintained, and security fixes
+or response times are not guaranteed. Independent operators should review,
+maintain, and secure their own deployments.
 
 ## Report a vulnerability privately
 
@@ -32,6 +33,6 @@ for rotation and incident-response guidance.
 
 ## Disclosure expectations
 
-Please allow time to reproduce, assess, and prepare a coordinated fix before
-publishing details. We will acknowledge valid reports through the private
-GitHub report and keep the report updated as the issue is triaged and fixed.
+Please use a private report before publishing details so that affected
+operators have an opportunity to assess the issue. Because development is
+halted, a maintainer response or coordinated fix is not guaranteed.

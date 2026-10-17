@@ -78,13 +78,13 @@ Never guess a workers.dev hostname or claim deployment success from a local buil
 
 ## GitHub Actions
 
-Pull requests run lint, typecheck, tests, build, and end-to-end coverage. The protected default branch may deploy only when these repository secrets are configured:
+Pull requests and pushes to `main` run lint, typecheck, tests, build, and end-to-end coverage. Development is halted, so automatic production deployment on push is retired. The production job runs only for an explicit `workflow_dispatch` from `main`, and only when these protected secrets are configured:
 
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `SNAPMETER_INGEST_SECRET`
 
-The deployment workflow validates the full workspace, applies remote migrations to `snapmeter-prod`, writes the ingest secret to a permission-restricted temporary file, and passes it to Wrangler during deployment. Missing secrets produce a clear skipped deployment rather than a false success claim. Protect the production environment with required reviewers if the repository supports it.
+The deployment workflow always validates the full workspace. On an authorized manual run from `main`, its production job applies remote migrations to `snapmeter-prod`, writes the ingest secret to a permission-restricted temporary file, and passes it to Wrangler during deployment. Push-triggered runs skip that job. Missing secrets on a manual run produce a clear skipped deployment rather than a false success claim. Protect the production environment with required reviewers if the repository supports it.
 
 Use a least-privilege Cloudflare token scoped to the target account's Workers Scripts, D1, and required deployment resources. Rotate it after suspected disclosure and remove stale GitHub environment approvals/runs as appropriate.
 

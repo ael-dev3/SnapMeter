@@ -1,5 +1,8 @@
 # Contributing to SnapMeter
 
+Development is halted. You are welcome to reuse the code and assets or maintain
+an independent fork; issues and pull requests may not receive a response.
+
 Thank you for helping improve SnapMeter. Contributions should preserve the
 project's metric integrity, privacy boundary, and reproducible build.
 
@@ -47,7 +50,9 @@ deployment or migration implications. Keep secrets and production data out of
 the PR description and CI logs.
 
 By submitting a contribution, you agree that your SnapMeter-authored
-contribution is licensed under the repository's MIT license. Do not submit
+contribution is licensed under the repository's MIT license. Original visual
+assets explicitly listed in `ASSET_LICENSE.md` also carry the stated CC0
+dedication. Do not submit
 third-party material unless redistribution is permitted and its exact source,
 license, and notice requirements are included. The vendored and adapted
 Snapchain protobufs and Warpkeep-derived Mini App portions are separately

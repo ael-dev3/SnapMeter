@@ -1,5 +1,8 @@
 # SnapMeter agent guide
 
+Development is halted. Preserve the public reuse licenses and third-party
+notices. Do not describe the project as actively maintained or promise support.
+
 This file is the operating contract for future Codex sessions. Preserve user work, keep analytics claims source-backed, and validate every touched surface before release.
 
 ## Repository map

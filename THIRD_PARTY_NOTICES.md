@@ -1,6 +1,6 @@
 # Third-party notices
 
-SnapMeter-authored material is licensed under the repository's [MIT License](LICENSE). The following files and adapted portions retain their upstream license and notices.
+SnapMeter-authored material is licensed under the repository's [MIT License](LICENSE), with an additional CC0 dedication for the original visual assets listed in [ASSET_LICENSE.md](ASSET_LICENSE.md). The following files and adapted portions retain their upstream license and notices; the CC0 dedication does not apply to them.
 
 ## Snapchain protocol definitions
 

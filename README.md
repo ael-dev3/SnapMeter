@@ -1,5 +1,7 @@
 # SnapMeter
 
+**Development is halted.** This repository is published for learning, reuse, and independent forks. Active maintenance, support, and continued operation of the hosted dashboard are not promised.
+
 **Live activity across Snapchain and Hypersnap.** SnapMeter is a mobile-first, real-time analytics dashboard for active Farcaster FIDs. It pairs a Windows-friendly collector with exact rolling metrics, a durable Cloudflare ingestion path, and a data-driven heartbeat that pulses only for newly observed qualifying activity.
 
 ## Live Dashboard
@@ -164,11 +166,13 @@ pnpm build
 pnpm test:e2e
 ```
 
-Pull requests run the quality gates. Default-branch deployment is conditional on the required Cloudflare repository secrets. Operational and security checks are documented in [Troubleshooting](docs/troubleshooting.md) and [Security](docs/security.md).
+Pull requests and default-branch pushes run the quality gates. Production deployment requires an explicit manual run of the deployment workflow on `main`, along with the required Cloudflare secrets; publishing source changes does not automatically modify production. Operational and security checks are documented in [Troubleshooting](docs/troubleshooting.md) and [Security](docs/security.md).
 
 ## License
 
-SnapMeter-authored source, documentation, and assets are released under the [MIT License](LICENSE), copyright 2026 ael-dev3. Vendored and adapted Snapchain protocol definitions retain upstream `GPL-3.0-only` terms, while the identified Warpkeep-derived Mini App portions retain Apache-2.0 notices. See [Third-party notices](THIRD_PARTY_NOTICES.md) and the complete texts in [`LICENSES/`](LICENSES/). Dependency packages retain their own licenses. No license grants rights to third-party names or trademarks.
+SnapMeter-authored source and documentation are released under the [MIT License](LICENSE), copyright 2026 ael-dev3. Original icons, artwork, and demo screenshots are additionally dedicated to the public domain under [CC0 1.0](LICENSES/CC0-1.0.txt): you may use, modify, share, and sell those assets, including in commercial projects, without attribution. See the exact file scope in [Asset licensing](ASSET_LICENSE.md).
+
+Vendored and adapted Snapchain protocol definitions retain upstream `GPL-3.0-only` terms, while the identified Warpkeep-derived Mini App portions retain Apache-2.0 notices. See [Third-party notices](THIRD_PARTY_NOTICES.md) and the complete texts in [`LICENSES/`](LICENSES/). Dependency packages retain their own licenses. No license grants rights to third-party names or trademarks.
 
 ## Documentation
 
